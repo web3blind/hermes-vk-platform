@@ -1,0 +1,46 @@
+manifest_version: 1
+name: vk-platform
+label: VK Messenger
+kind: platform
+version: 0.1.0
+description: >
+  VK Messenger gateway adapter for Hermes Agent. Uses VK community messages
+  and Group Long Poll to relay messages between VK chats and Hermes.
+author: Community
+license: MIT
+homepage: https://github.com/web3blind/hermes-vk-platform
+requires_env:
+  - name: VK_GROUP_TOKEN
+    description: "VK community access token with messages permission"
+    prompt: "VK community token"
+    url: "https://dev.vk.com/en/api/access-token/community-token"
+    secret: true
+  - name: VK_GROUP_ID
+    description: "Numeric VK community/group id, without leading minus"
+    prompt: "VK group id"
+    secret: false
+optional_env:
+  - name: VK_ALLOWED_USERS
+    description: "Comma-separated VK user ids allowed to talk to the bot"
+    prompt: "Allowed VK user ids"
+    secret: false
+  - name: VK_ALLOWED_PEERS
+    description: "Comma-separated VK peer ids/chats allowed to talk to the bot"
+    prompt: "Allowed VK peer ids"
+    secret: false
+  - name: VK_ALLOW_ALL_USERS
+    description: "Allow all VK senders (unsafe; testing only)"
+    prompt: "Allow all users? (true/false)"
+    secret: false
+  - name: VK_HOME_CHANNEL
+    description: "Default VK peer id for cron / notification delivery"
+    prompt: "VK home peer id"
+    secret: false
+  - name: VK_DOWNLOAD_ATTACHMENTS
+    description: "Download all inbound VK attachments to the Hermes cache (true/false)"
+    prompt: "Download inbound attachments?"
+    secret: false
+  - name: VK_USER_TOKEN
+    description: "Optional user token for VK video metadata fallback; not needed for normal text/chat usage"
+    prompt: "Optional VK user token"
+    secret: true

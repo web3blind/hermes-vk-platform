@@ -32,6 +32,22 @@ optional_env:
     description: "Allow all VK senders (unsafe; testing only)"
     prompt: "Allow all users? (true/false)"
     secret: false
+  - name: VK_ACCESS_POLICY
+    description: "Access policy: any, user_only, peer_only, or peer_and_user"
+    prompt: "VK access policy"
+    secret: false
+  - name: VK_ALLOWED_USERS_BY_PEER
+    description: "Per-peer user allowlist in format peer:user|user;peer:user"
+    prompt: "Allowed VK users by peer"
+    secret: false
+  - name: VK_DEDUPE_TTL_SECONDS
+    description: "Duplicate message_new TTL in seconds; dedupe key is peer_id + conversation_message_id"
+    prompt: "Duplicate event TTL seconds"
+    secret: false
+  - name: VK_MAX_ATTACHMENT_BYTES
+    description: "Maximum inbound attachment download size in bytes"
+    prompt: "Max inbound attachment bytes"
+    secret: false
   - name: VK_HOME_CHANNEL
     description: "Default VK peer id for cron / notification delivery"
     prompt: "VK home peer id"

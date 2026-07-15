@@ -9,10 +9,11 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Inbound VK `message_new` events through Group Long Poll.
 - Outbound replies with `messages.send`.
 - Direct messages and VK group conversations (`peer_id = 2000000000 + chat_id`).
-- Safe allowlist controls for VK users and peers.
+- Safe allowlist controls for VK users, peers, and peer+user policies.
+- TTL dedupe for repeated Long Poll `message_new` events after reconnect.
 - Optional cron/home-channel delivery through `VK_HOME_CHANNEL`.
 - Message editing for Hermes tool-progress bubbles through `messages.edit`.
-- Inbound media handling for photos, documents, voice messages, audio, video messages, and direct video files.
+- Inbound media handling for photos, documents, voice messages, audio, video messages, and direct video files with bounded downloads.
 - Outbound media upload for image files, documents, voice files, and videos.
 - Optional per-channel prompts and skill bindings through Hermes config.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
@@ -90,6 +91,40 @@ VK_ALLOWED_USERS=123456,789012
 VK_ALLOWED_PEERS=123456,2000000001
 ```
 
+By default the access policy is backward-compatible:
+
+```text
+allowed user OR allowed peer
+```
+
+That means `VK_ALLOWED_PEERS=2000000001` allows **every participant of that VK chat** to talk to Hermes. This can be useful for a small private chat whose membership you fully control, but it is risky for larger or public group conversations.
+
+For stricter access, choose an explicit policy:
+
+```dotenv
+# Backward-compatible default: allowed user OR allowed peer.
+VK_ACCESS_POLICY=any
+
+# Only users from VK_ALLOWED_USERS may talk to Hermes.
+VK_ACCESS_POLICY=user_only
+
+# Only peers/chats from VK_ALLOWED_PEERS may talk to Hermes.
+# Warning: in group chats, this allows every participant of the chat.
+VK_ACCESS_POLICY=peer_only
+
+# Sender must be in VK_ALLOWED_USERS AND chat must be in VK_ALLOWED_PEERS.
+VK_ACCESS_POLICY=peer_and_user
+```
+
+You can also restrict particular chats to particular users:
+
+```dotenv
+# Format: peer:user|user;peer:user
+VK_ALLOWED_USERS_BY_PEER=2000000001:123456|789012;2000000002:123456
+```
+
+`VK_ALLOWED_USERS_BY_PEER` takes precedence for the listed peer. If a peer is listed there, only the listed users are accepted in that peer.
+
 For VK group conversations, peer id is:
 
 ```text
@@ -117,6 +152,12 @@ VK_HOME_CHANNEL=2000000001
 # Download all inbound attachments to Hermes cache, not only file-like direct URLs:
 VK_DOWNLOAD_ATTACHMENTS=false
 
+# Maximum inbound attachment download size in bytes. Default: 25 MiB.
+VK_MAX_ATTACHMENT_BYTES=26214400
+
+# In-memory duplicate event TTL in seconds. Default: 1800.
+VK_DEDUPE_TTL_SECONDS=1800
+
 # Optional user token for video metadata fallback. Not needed for normal chat usage.
 VK_USER_TOKEN=
 ```
@@ -132,6 +173,12 @@ vk:
     - "123456"
   allowed_peers:
     - "2000000001"
+  access_policy: "peer_and_user"
+  allowed_users_by_peer:
+    "2000000001":
+      - "123456"
+  max_attachment_bytes: 26214400
+  dedupe_ttl_seconds: 1800
   home_channel: "2000000001"
   channel_prompts:
     "2000000001": "This is a trusted VK chat. Keep replies concise."
@@ -190,7 +237,7 @@ A log line like this means the adapter deliberately ignored the message:
 VK: ignoring unauthorized sender=<user_id> peer=<peer_id>
 ```
 
-Add the exact user id to `VK_ALLOWED_USERS` or the exact peer id to `VK_ALLOWED_PEERS`, then restart the gateway.
+Add the exact user id to `VK_ALLOWED_USERS` or the exact peer id to `VK_ALLOWED_PEERS`, then restart the gateway. If `VK_ACCESS_POLICY=peer_and_user`, both must match. If the peer is listed in `VK_ALLOWED_USERS_BY_PEER`, the sender must be listed for that peer.
 
 ### Group chat peer id confusion
 
@@ -213,6 +260,9 @@ VK messages are chunked according to the adapter max message length. The default
 ## Security model
 
 - The adapter enforces its own allowlist before passing messages to Hermes.
+- `VK_ALLOWED_PEERS` permits every participant in the listed group chat unless you use `VK_ACCESS_POLICY=peer_and_user` or `VK_ALLOWED_USERS_BY_PEER`.
+- Repeated Long Poll events are deduplicated in memory by `peer_id + conversation_message_id` for `VK_DEDUPE_TTL_SECONDS`.
+- Inbound attachment downloads are streamed to cache and capped by `VK_MAX_ATTACHMENT_BYTES`.
 - Tokens are redacted from adapter errors.
 - `VK_ALLOW_ALL_USERS=true` is intentionally treated as unsafe.
 - Remote image URLs are sent as URLs instead of silently downloading arbitrary remote image data for outbound sends.

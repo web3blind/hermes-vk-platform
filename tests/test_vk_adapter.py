@@ -10,6 +10,7 @@ from gateway.platforms.base import MessageType
 from gateway.session import SessionSource, build_session_key
 from adapter import (
     VKAdapter,
+    _download_attachment,
     _apply_yaml_config,
     _env_enablement,
     _looks_like_downloadable_attachment_url,
@@ -28,6 +29,10 @@ def clear_vk_env(monkeypatch):
         "VK_ALLOW_ALL_USERS",
         "VK_HOME_CHANNEL",
         "VK_DOWNLOAD_ATTACHMENTS",
+        "VK_ACCESS_POLICY",
+        "VK_ALLOWED_USERS_BY_PEER",
+        "VK_DEDUPE_TTL_SECONDS",
+        "VK_MAX_ATTACHMENT_BYTES",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -51,6 +56,57 @@ def test_vk_adapter_denies_by_default_and_allows_explicit_users_or_peers():
     assert adapter._is_authorized(from_id="100", peer_id="1") is True
     assert adapter._is_authorized(from_id="999", peer_id="2000000001") is True
     assert adapter._is_authorized(from_id="999", peer_id="1") is False
+
+
+def test_vk_access_policy_peer_and_user_requires_both_allowlists():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "group_id": "123456789",
+                "allowed_users": ["100"],
+                "allowed_peers": ["2000000001"],
+                "access_policy": "peer_and_user",
+            },
+        )
+    )
+
+    assert adapter._is_authorized(from_id="100", peer_id="2000000001") is True
+    assert adapter._is_authorized(from_id="100", peer_id="2000000999") is False
+    assert adapter._is_authorized(from_id="999", peer_id="2000000001") is False
+
+
+def test_vk_allowed_users_by_peer_limits_specific_chat_members():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000001", "2000000002"],
+                "allowed_users_by_peer": {"2000000001": ["100", "101"]},
+            },
+        )
+    )
+
+    assert adapter._is_authorized(from_id="100", peer_id="2000000001") is True
+    assert adapter._is_authorized(from_id="999", peer_id="2000000001") is False
+    assert adapter._is_authorized(from_id="999", peer_id="2000000002") is True
+
+
+def test_vk_unknown_access_policy_fails_closed():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "group_id": "123456789",
+                "allowed_users": ["100"],
+                "allowed_peers": ["2000000001"],
+                "access_policy": "typo",
+            },
+        )
+    )
+
+    assert adapter._is_authorized(from_id="100", peer_id="2000000001") is False
 
 
 def test_vk_session_keys_are_isolated_per_peer_and_user():
@@ -97,7 +153,15 @@ def test_vk_peer_allowlist_is_honored_by_gateway_authz(monkeypatch):
         )
     )
 
-    from gateway.run import GatewayRunner
+    try:
+        from gateway.run import GatewayRunner
+    except ModuleNotFoundError:
+        # Standalone public-plugin CI installs only the narrow test deps, not the
+        # full Hermes gateway dependency set. The adapter-level contract still
+        # matters there: restricted intake must advertise that gateway auth can
+        # trust this platform's own allowlist.
+        assert adapter.enforces_own_access_policy is True
+        return
 
     runner = cast(Any, object.__new__(GatewayRunner))
     platform = adapter.platform
@@ -209,6 +273,35 @@ def test_vk_attachment_extraction_covers_required_inbound_formats():
 
 
 @pytest.mark.asyncio
+async def test_vk_message_new_duplicate_is_ignored_before_enrichment_and_download():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"], "dedupe_ttl_seconds": 300},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    update = {
+        "type": "message_new",
+        "object": {
+            "message": {
+                "from_id": 100,
+                "peer_id": 2000000001,
+                "conversation_message_id": 7,
+                "text": "повтори",
+            }
+        },
+    }
+
+    await adapter._handle_update(update)
+    await adapter._handle_update(update)
+
+    assert adapter.handle_message.await_count == 1
+    assert adapter._vk_method.await_count == 2  # first enrich + first context resolve only
+
+
+@pytest.mark.asyncio
 async def test_vk_message_new_with_attachment_builds_media_event():
     adapter = VKAdapter(
         PlatformConfig(
@@ -248,7 +341,7 @@ async def test_vk_message_new_with_attachment_builds_media_event():
     assert event.media_types == ["audio/ogg"]
     assert event.source.chat_name == "Voice Test Chat"
     assert event.source.chat_topic == "VK Web chat URL: https://vk.com/im?sel=c1"
-    download.assert_awaited_once_with("https://vk.example/voice.ogg", "audio/ogg")
+    download.assert_awaited_once_with("https://vk.example/voice.ogg", "audio/ogg", max_bytes=26214400)
     assert "голосовое сообщение" in event.text
 
 
@@ -256,7 +349,8 @@ async def test_vk_message_new_with_attachment_builds_media_event():
 async def test_vk_materializes_direct_media_urls_for_gateway_processors():
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
 
-    async def fake_download(url, media_type):
+    async def fake_download(url, media_type, *, max_bytes):
+        assert max_bytes == 26214400
         return f"/tmp/{media_type.replace('/', '-')}-{url.rsplit('/', 1)[-1]}"
 
     urls = [
@@ -277,6 +371,63 @@ async def test_vk_materializes_direct_media_urls_for_gateway_processors():
         "/tmp/application-pdf-report.pdf",
     ]
     assert download.await_count == 4
+
+
+def test_vk_download_attachment_rejects_content_length_over_limit(monkeypatch, tmp_path):
+    class Headers:
+        def get(self, name):
+            return "11" if name == "Content-Length" else None
+
+        def get_content_type(self):
+            return "audio/ogg"
+
+    class Response:
+        headers = Headers()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            raise AssertionError("body should not be read when Content-Length exceeds limit")
+
+    monkeypatch.setattr("adapter.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(RuntimeError, match="too large"):
+        _download_attachment("https://vk.example/voice.ogg", "audio/ogg", max_bytes=10)
+
+
+def test_vk_download_attachment_streams_and_stops_after_limit(monkeypatch, tmp_path):
+    class Headers:
+        def get(self, _name):
+            return None
+
+        def get_content_type(self):
+            return "application/octet-stream"
+
+    class Response:
+        headers = Headers()
+        chunks = [b"12345", b"67890", b"x"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return self.chunks.pop(0) if self.chunks else b""
+
+    monkeypatch.setattr("adapter.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(RuntimeError, match="exceeded size limit"):
+        _download_attachment("https://vk.example/file.pdf", "application/pdf", max_bytes=10)
+
+    assert not list((tmp_path / "cache" / "vk" / "attachments").glob("*.pdf"))
 
 
 def test_vk_regular_video_watch_page_is_not_treated_as_downloadable_file():

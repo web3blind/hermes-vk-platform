@@ -106,6 +106,25 @@ def setup_vk_platform() -> None:
     if peers:
         _save_env("VK_ALLOWED_PEERS", _join_csv(_split_csv(peers)))
 
+    current_policy = get_env_value("VK_ACCESS_POLICY") or "any"
+    print(
+        "\nAccess policy options: any (user OR peer), user_only, peer_only, peer_and_user.\n"
+        "Warning: peer_only/allowed peer chats allow every participant of that VK chat."
+    )
+    policy = _ask("VK access policy", default=current_policy).strip().lower() or "any"
+    if policy not in {"any", "user_only", "peer_only", "peer_and_user"}:
+        print("  ! Unknown policy; saving fail-closed value is not useful, keeping 'any'.")
+        policy = "any"
+    _save_env("VK_ACCESS_POLICY", policy)
+
+    current_users_by_peer = get_env_value("VK_ALLOWED_USERS_BY_PEER") or ""
+    users_by_peer = _ask(
+        "Optional per-peer user allowlist (peer:user|user;peer:user), empty to skip",
+        default=current_users_by_peer,
+    )
+    if users_by_peer:
+        _save_env("VK_ALLOWED_USERS_BY_PEER", users_by_peer)
+
     current_open = get_env_value("VK_ALLOW_ALL_USERS") or "false"
     if not users and not peers:
         allow_all = _ask("No allowlist was provided. Allow all VK users? UNSAFE, testing only", default=current_open)
@@ -123,6 +142,16 @@ def setup_vk_platform() -> None:
     current_download = get_env_value("VK_DOWNLOAD_ATTACHMENTS") or ""
     download = _ask("Download inbound attachments to Hermes cache? true/false", default=current_download or "false")
     _save_env("VK_DOWNLOAD_ATTACHMENTS", "true" if _truthy_answer(download) else "false")
+
+    current_max_attachment = get_env_value("VK_MAX_ATTACHMENT_BYTES") or "26214400"
+    max_attachment = _ask("Maximum inbound attachment size in bytes", default=current_max_attachment)
+    if max_attachment:
+        _save_env("VK_MAX_ATTACHMENT_BYTES", max_attachment)
+
+    current_dedupe_ttl = get_env_value("VK_DEDUPE_TTL_SECONDS") or "1800"
+    dedupe_ttl = _ask("Duplicate event TTL in seconds", default=current_dedupe_ttl)
+    if dedupe_ttl:
+        _save_env("VK_DEDUPE_TTL_SECONDS", dedupe_ttl)
 
     print("\nDone. Next steps:")
     print("  1. Run: hermes gateway restart")

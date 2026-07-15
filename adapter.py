@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 VK_API_VERSION = "5.199"
 VK_API_BASE = "https://api.vk.com/method"
+DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+DEFAULT_DEDUPE_TTL_SECONDS = 30 * 60
+VALID_ACCESS_POLICIES = {"any", "user_only", "peer_only", "peer_and_user"}
+DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "application/octet-stream")
 
 
 def _truthy(value: Any) -> bool:
@@ -54,6 +58,42 @@ def _split_csv(value: Any) -> set[str]:
     else:
         items = str(value).split(",")
     return {str(item).strip() for item in items if str(item).strip()}
+
+
+def _parse_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
+    """Parse per-peer user allowlists from config/env.
+
+    YAML config may provide ``{peer_id: [user_id, ...]}``. Environment values
+    use ``peer:user|user;peer:user`` to avoid introducing a JSON parser burden
+    in setup examples.
+    """
+    result: dict[str, set[str]] = {}
+    if not value:
+        return result
+    if isinstance(value, dict):
+        for peer, users in value.items():
+            peer_id = str(peer).strip()
+            parsed_users = _split_csv(users)
+            if peer_id and parsed_users:
+                result[peer_id] = parsed_users
+        return result
+    for chunk in str(value).split(";"):
+        if ":" not in chunk:
+            continue
+        peer, users = chunk.split(":", 1)
+        peer_id = peer.strip()
+        parsed_users = {item.strip() for item in users.replace(",", "|").split("|") if item.strip()}
+        if peer_id and parsed_users:
+            result[peer_id] = parsed_users
+    return result
 
 
 def _redact_token(text: str) -> str:
@@ -133,12 +173,19 @@ async def _multipart_upload_async(url: str, field_name: str, file_path: str, *, 
     return await asyncio.to_thread(_multipart_upload, url, field_name, file_path, timeout=timeout)
 
 
-def _download_attachment(url: str, media_type: str = "", *, timeout: int = 60) -> str:
-    """Download a VK attachment to a local cache path for gateway processors.
+def _download_attachment(
+    url: str,
+    media_type: str = "",
+    *,
+    timeout: int = 60,
+    max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+) -> str:
+    """Download a VK attachment to a bounded local cache path.
 
     Core gateway enrichers (STT, image/video context) expect local files. VK
     Long Poll gives direct HTTPS attachment URLs, so voice messages must be
-    materialized locally before dispatching ``MessageEvent``.
+    materialized locally before dispatching ``MessageEvent``.  Downloads are
+    capped and streamed so a hostile attachment cannot be read fully into RAM.
     """
     parsed = urllib.parse.urlparse(url)
     suffix = Path(parsed.path).suffix.lower()
@@ -153,14 +200,47 @@ def _download_attachment(url: str, media_type: str = "", *, timeout: int = 60) -
     req = urllib.request.Request(url, headers={"User-Agent": "Hermes-VK-Adapter/0.1"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - VK-provided attachment URL
-            target.write_bytes(resp.read())
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise RuntimeError(f"VK attachment is too large: {content_length} bytes > {max_bytes}")
+                except ValueError:
+                    pass
+            content_type = (resp.headers.get_content_type() or "").lower()
+            declared_type = (media_type or "").lower()
+            if declared_type and not declared_type.startswith(DOWNLOADABLE_MIME_PREFIXES):
+                raise RuntimeError(f"VK attachment media type is not allowed: {declared_type}")
+            if content_type and content_type != "application/octet-stream":
+                declared_top = declared_type.split("/", 1)[0] if "/" in declared_type else ""
+                content_top = content_type.split("/", 1)[0] if "/" in content_type else ""
+                if declared_top in {"image", "video", "audio"} and content_top != declared_top:
+                    raise RuntimeError(f"VK attachment content type mismatch: {content_type} for {declared_type}")
+            total = 0
+            with target.open("wb") as fh:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        fh.close()
+                        target.unlink(missing_ok=True)
+                        raise RuntimeError(f"VK attachment exceeded size limit: {total} bytes > {max_bytes}")
+                    fh.write(chunk)
     except urllib.error.URLError as exc:
         raise RuntimeError(_redact_token(str(exc))) from exc
     return str(target)
 
 
-async def _download_attachment_async(url: str, media_type: str = "", *, timeout: int = 60) -> str:
-    return await asyncio.to_thread(_download_attachment, url, media_type, timeout=timeout)
+async def _download_attachment_async(
+    url: str,
+    media_type: str = "",
+    *,
+    timeout: int = 60,
+    max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+) -> str:
+    return await asyncio.to_thread(_download_attachment, url, media_type, timeout=timeout, max_bytes=max_bytes)
 
 
 def _looks_like_downloadable_attachment_url(url: str) -> bool:
@@ -196,8 +276,20 @@ class VKAdapter(BasePlatformAdapter):
 
         self.allowed_users = _split_csv(os.getenv("VK_ALLOWED_USERS") or extra.get("allowed_users"))
         self.allowed_peers = _split_csv(os.getenv("VK_ALLOWED_PEERS") or extra.get("allowed_peers"))
+        self.allowed_users_by_peer = _parse_users_by_peer(
+            os.getenv("VK_ALLOWED_USERS_BY_PEER") or extra.get("allowed_users_by_peer")
+        )
         self.allow_all_users = _truthy(os.getenv("VK_ALLOW_ALL_USERS") or extra.get("allow_all_users"))
-        access_policy = "allowlist" if self.allowed_users or self.allowed_peers else "open"
+        self.access_policy = str(os.getenv("VK_ACCESS_POLICY") or extra.get("access_policy") or "any").strip().lower()
+        self.dedupe_ttl_seconds = _parse_positive_int(
+            os.getenv("VK_DEDUPE_TTL_SECONDS") or extra.get("dedupe_ttl_seconds"),
+            DEFAULT_DEDUPE_TTL_SECONDS,
+        )
+        self.max_attachment_bytes = _parse_positive_int(
+            os.getenv("VK_MAX_ATTACHMENT_BYTES") or extra.get("max_attachment_bytes"),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        )
+        access_policy = "allowlist" if self.allowed_users or self.allowed_peers or self.allowed_users_by_peer else "open"
         self._dm_policy = access_policy
         self._group_policy = access_policy
 
@@ -211,6 +303,7 @@ class VKAdapter(BasePlatformAdapter):
         self._lp_ts = ""
         self._lock_key: Optional[str] = None
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
+        self._seen_message_keys: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -344,6 +437,9 @@ class VKAdapter(BasePlatformAdapter):
             return
 
         conversation_message_id = msg.get("conversation_message_id") or msg.get("id")
+        if self._is_duplicate_event(peer_id=peer_id, conversation_message_id=conversation_message_id):
+            logger.info("VK: ignoring duplicate event peer=%s cmid=%s", peer_id, conversation_message_id)
+            return
         msg = await self._enrich_message_from_api(msg, peer_id=peer_id, conversation_message_id=conversation_message_id)
 
         text = str(msg.get("text") or "").strip()
@@ -638,20 +734,47 @@ class VKAdapter(BasePlatformAdapter):
                 materialized.append(url)
                 continue
             try:
-                materialized.append(await _download_attachment_async(url, media_type))
+                materialized.append(await _download_attachment_async(url, media_type, max_bytes=self.max_attachment_bytes))
             except Exception as exc:
                 logger.warning("VK: failed to download inbound attachment — %s", _redact_token(str(exc)))
                 materialized.append(url)
         return materialized
 
+    def _is_duplicate_event(self, *, peer_id: str, conversation_message_id: Any) -> bool:
+        if not peer_id or conversation_message_id in (None, "") or self.dedupe_ttl_seconds <= 0:
+            return False
+        now = time.monotonic()
+        # Keep the tiny in-memory cache bounded by evicting expired keys on every
+        # message.  Long Poll duplicates usually arrive shortly after reconnect.
+        expired = [key for key, expires_at in self._seen_message_keys.items() if expires_at <= now]
+        for key in expired:
+            self._seen_message_keys.pop(key, None)
+        key = f"{peer_id}:{conversation_message_id}"
+        if key in self._seen_message_keys:
+            return True
+        self._seen_message_keys[key] = now + self.dedupe_ttl_seconds
+        return False
+
     def _is_authorized(self, *, from_id: str, peer_id: str) -> bool:
         if self.allow_all_users:
             return True
-        if from_id and from_id in self.allowed_users:
-            return True
-        if peer_id and peer_id in self.allowed_peers:
-            return True
-        return False
+
+        peer_allowed = bool(peer_id and peer_id in self.allowed_peers)
+        user_allowed = bool(from_id and from_id in self.allowed_users)
+        peer_specific_users = self.allowed_users_by_peer.get(peer_id) if peer_id else None
+        if peer_specific_users is not None:
+            return bool(from_id and from_id in peer_specific_users)
+
+        if self.access_policy not in VALID_ACCESS_POLICIES:
+            logger.error("VK: unknown access policy %r; denying message", self.access_policy)
+            return False
+        if self.access_policy == "any":
+            return user_allowed or peer_allowed
+        if self.access_policy == "user_only":
+            return user_allowed
+        if self.access_policy == "peer_only":
+            return peer_allowed
+        return peer_allowed and user_allowed
 
     @staticmethod
     def _attachment_url(kind: str, payload: dict[str, Any]) -> str:
@@ -1028,6 +1151,18 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "allowed_peers": sorted(_split_csv(os.getenv("VK_ALLOWED_PEERS"))),
         "allow_all_users": _truthy(os.getenv("VK_ALLOW_ALL_USERS")),
     }
+    access_policy = os.getenv("VK_ACCESS_POLICY")
+    if access_policy:
+        extra["access_policy"] = access_policy
+    users_by_peer = os.getenv("VK_ALLOWED_USERS_BY_PEER")
+    if users_by_peer:
+        extra["allowed_users_by_peer"] = {k: sorted(v) for k, v in _parse_users_by_peer(users_by_peer).items()}
+    max_attachment_bytes = os.getenv("VK_MAX_ATTACHMENT_BYTES")
+    if max_attachment_bytes:
+        extra["max_attachment_bytes"] = _parse_positive_int(max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES)
+    dedupe_ttl = os.getenv("VK_DEDUPE_TTL_SECONDS")
+    if dedupe_ttl:
+        extra["dedupe_ttl_seconds"] = _parse_positive_int(dedupe_ttl, DEFAULT_DEDUPE_TTL_SECONDS)
     home = os.getenv("VK_HOME_CHANNEL")
     if home:
         extra["home_channel"] = home
@@ -1045,6 +1180,10 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
         "allowed_users": "VK_ALLOWED_USERS",
         "allowed_peers": "VK_ALLOWED_PEERS",
         "allow_all_users": "VK_ALLOW_ALL_USERS",
+        "access_policy": "VK_ACCESS_POLICY",
+        "allowed_users_by_peer": "VK_ALLOWED_USERS_BY_PEER",
+        "dedupe_ttl_seconds": "VK_DEDUPE_TTL_SECONDS",
+        "max_attachment_bytes": "VK_MAX_ATTACHMENT_BYTES",
         "home_channel": "VK_HOME_CHANNEL",
     }
     for key, env_name in mapping.items():
@@ -1053,6 +1192,12 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
             continue
         if key in {"allowed_users", "allowed_peers"} and isinstance(value, (list, tuple, set)):
             value_str = ",".join(str(v) for v in value)
+        elif key == "allowed_users_by_peer" and isinstance(value, dict):
+            value_str = ";".join(
+                f"{peer}:{'|'.join(str(user) for user in users)}"
+                for peer, users in value.items()
+                if isinstance(users, (list, tuple, set))
+            )
         else:
             value_str = str(value)
         if not os.getenv(env_name):

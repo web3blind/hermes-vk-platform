@@ -13,6 +13,7 @@ from adapter import (
     _download_attachment,
     _apply_yaml_config,
     _env_enablement,
+    _is_retryable_vk_error,
     _looks_like_downloadable_attachment_url,
     _split_csv,
 )
@@ -23,6 +24,7 @@ def clear_vk_env(monkeypatch):
     for key in (
         "VK_GROUP_TOKEN",
         "VK_USER_TOKEN",
+        "VKBLOG_USER_TOKEN",
         "VK_GROUP_ID",
         "VK_ALLOWED_USERS",
         "VK_ALLOWED_PEERS",
@@ -270,6 +272,62 @@ def test_vk_attachment_extraction_covers_required_inbound_formats():
         "video/mp4",
         "application/pdf",
     ]
+
+
+def test_vk_user_token_falls_back_to_vkblog_alias(monkeypatch):
+    monkeypatch.setenv("VKBLOG_USER_TOKEN", "vkblog-token")
+
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
+
+    assert adapter.user_token == "vkblog-token"
+
+
+def test_vk_video_without_direct_media_uses_best_preview_frame():
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
+    attachments = [
+        {
+            "type": "video",
+            "video": {
+                "owner_id": 103,
+                "id": 456,
+                "is_from_message": 1,
+                "first_frame": [
+                    {"width": 160, "height": 90, "url": "https://sun9-1.userapi.com/small.jpg"},
+                    {"width": 640, "height": 360, "url": "https://sun9-1.userapi.com/big.jpg"},
+                ],
+                "image": [{"width": 320, "height": 180, "url": "https://sun9-1.userapi.com/mid.jpg"}],
+            },
+        }
+    ]
+
+    message_type, urls, media_types = adapter._extract_attachment_media(attachments)  # type: ignore[attr-defined]
+
+    assert message_type is MessageType.VIDEO
+    assert urls == ["https://sun9-1.userapi.com/big.jpg"]
+    assert media_types == ["image/jpeg"]
+
+
+def test_vk_video_merge_preserves_original_preview_when_enrichment_has_no_file():
+    original = {
+        "owner_id": 103,
+        "id": 456,
+        "access_key": "ak",
+        "first_frame": [{"width": 640, "height": 360, "url": "https://sun9-1.userapi.com/live.jpg"}],
+    }
+    enriched = {
+        "owner_id": 103,
+        "id": 456,
+        "is_from_message": 1,
+        "player": "https://vkvideo.example/watch",
+        "first_frame": [{"width": 640, "height": 360, "url": "https://iv.okcdn.ru/expired.jpg"}],
+    }
+
+    merged = VKAdapter._merge_video_payload(original, enriched)
+
+    assert merged["player"] == "https://vkvideo.example/watch"
+    assert merged["is_from_message"] == 1
+    assert merged["access_key"] == "ak"
+    assert merged["first_frame"] == original["first_frame"]
 
 
 @pytest.mark.asyncio
@@ -714,6 +772,90 @@ async def test_vk_send_image_file_uploads_and_sends_attachment(tmp_path):
 
     assert result.success is True
     assert result.message_id == "123"
+
+
+def test_vk_retryable_error_classifier_is_narrow():
+    assert _is_retryable_vk_error(RuntimeError('VK upload failed: "unknown error"')) is True
+    assert _is_retryable_vk_error(RuntimeError('VK API error 6: Too many requests per second')) is True
+    assert _is_retryable_vk_error(RuntimeError('VK API error 5: User authorization failed')) is False
+    assert _is_retryable_vk_error(RuntimeError('VK docs upload server response is missing upload_url')) is False
+
+
+@pytest.mark.asyncio
+async def test_vk_voice_upload_retries_once_on_transient_upload_error(tmp_path):
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"ogg")
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    calls = []
+
+    async def fake_vk_method(method, params=None):
+        calls.append((method, params))
+        if method == "docs.getMessagesUploadServer":
+            return {"response": {"upload_url": "https://upload.example/doc"}}
+        if method == "docs.save":
+            return {"response": {"audio_message": {"owner_id": -123456789, "id": 22, "access_key": "ak"}}}
+        if method == "messages.send":
+            assert params is not None
+            assert params["attachment"] == "doc-123456789_22_ak"
+            return {"response": 123}
+        raise AssertionError(method)
+
+    adapter._vk_method = fake_vk_method
+    upload = AsyncMock(side_effect=[RuntimeError('VK upload failed: "unknown error"'), {"file": "server-payload"}])
+    with patch("adapter._multipart_upload_async", upload), \
+         patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+        result = await adapter.send_voice("2000000001", str(audio), caption="caption")
+
+    assert result.success is True
+    assert result.message_id == "123"
+    assert upload.await_count == 2
+    sleep.assert_awaited_once_with(5.0)
+    assert [method for method, _params in calls].count("docs.getMessagesUploadServer") == 2
+
+
+@pytest.mark.asyncio
+async def test_vk_voice_upload_does_not_retry_non_retryable_error(tmp_path):
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"ogg")
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+
+    async def fake_vk_method(method, params=None):
+        if method == "docs.getMessagesUploadServer":
+            return {"response": {"upload_url": "https://upload.example/doc"}}
+        raise AssertionError(method)
+
+    adapter._vk_method = fake_vk_method
+    upload = AsyncMock(side_effect=RuntimeError("VK upload returned non-JSON response: '<html>'"))
+    with patch("adapter._multipart_upload_async", upload), \
+         patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+        result = await adapter.send_voice("2000000001", str(audio), caption="caption")
+
+    assert result.success is False
+    assert upload.await_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vk_send_attachment_retries_once_on_transient_send_error():
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    attempts = 0
+
+    async def fake_vk_method(method, params=None):
+        nonlocal attempts
+        attempts += 1
+        assert method == "messages.send"
+        if attempts == 1:
+            raise RuntimeError("VK API error 6: Too many requests per second")
+        return {"response": 123}
+
+    adapter._vk_method = fake_vk_method
+    with patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+        result = await adapter._send_attachment("2000000001", "doc-1_2", "caption")
+
+    assert result.success is True
+    assert result.message_id == "123"
+    assert attempts == 2
+    sleep.assert_awaited_once_with(5.0)
 
 
 @pytest.mark.asyncio

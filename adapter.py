@@ -42,6 +42,7 @@ VK_API_VERSION = "5.199"
 VK_API_BASE = "https://api.vk.com/method"
 DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 DEFAULT_DEDUPE_TTL_SECONDS = 30 * 60
+VK_TRANSIENT_RETRY_DELAY_SECONDS = 5.0
 VALID_ACCESS_POLICIES = {"any", "user_only", "peer_only", "peer_and_user"}
 DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "application/octet-stream")
 
@@ -97,7 +98,7 @@ def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
 
 
 def _redact_token(text: str) -> str:
-    for token in (os.getenv("VK_GROUP_TOKEN", ""), os.getenv("VK_USER_TOKEN", "")):
+    for token in (os.getenv("VK_GROUP_TOKEN", ""), os.getenv("VK_USER_TOKEN", ""), os.getenv("VKBLOG_USER_TOKEN", "")):
         if token:
             text = text.replace(token, "[REDACTED]")
     return text
@@ -171,6 +172,63 @@ def _multipart_upload(url: str, field_name: str, file_path: str, *, timeout: int
 
 async def _multipart_upload_async(url: str, field_name: str, file_path: str, *, timeout: int = 120) -> dict[str, Any]:
     return await asyncio.to_thread(_multipart_upload, url, field_name, file_path, timeout=timeout)
+
+
+def _is_retryable_vk_error(exc: Exception) -> bool:
+    """Return whether an outbound VK failure is worth one delayed retry.
+
+    VK upload endpoints can occasionally return a bare ``"unknown error"``
+    despite the same file/peer succeeding moments later.  Retry only transient
+    transport/server/rate-limit shapes; never retry auth, permission, missing
+    upload URL, malformed response, or local validation errors.
+    """
+    text = str(exc).lower()
+    retryable_markers = (
+        "unknown error",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "temporary failure",
+        "connection reset",
+        "remote end closed connection",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "too many requests",
+        "too many requests per second",
+        "vk api error 6:",
+        "vk api error 10:",
+    )
+    non_retryable_markers = (
+        "vk api error 5:",   # auth failed
+        "vk api error 7:",   # permission denied
+        "vk api error 15:",  # access denied
+        "vk api error 100:", # invalid parameter
+        "missing upload_url",
+        "missing owner_id/id",
+        "non-json response",
+        "too large",
+        "exceeded size limit",
+    )
+    return any(marker in text for marker in retryable_markers) and not any(
+        marker in text for marker in non_retryable_markers
+    )
+
+
+async def _retry_vk_transient_once(label: str, operation):
+    try:
+        return await operation()
+    except Exception as exc:
+        if not _is_retryable_vk_error(exc):
+            raise
+        logger.warning(
+            "VK: transient %s failed (%s); retrying once in %.0fs",
+            label,
+            _redact_token(str(exc)),
+            VK_TRANSIENT_RETRY_DELAY_SECONDS,
+        )
+        await asyncio.sleep(VK_TRANSIENT_RETRY_DELAY_SECONDS)
+        return await operation()
 
 
 def _download_attachment(
@@ -270,7 +328,7 @@ class VKAdapter(BasePlatformAdapter):
         # Optional user token for VK API methods that are not available to
         # community tokens (notably ``video.get``). It is used only inside the
         # VK plugin as a native API fallback, never exposed to the agent.
-        self.user_token = os.getenv("VK_USER_TOKEN") or extra.get("user_token", "")
+        self.user_token = os.getenv("VK_USER_TOKEN") or os.getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
 
@@ -567,8 +625,7 @@ class VKAdapter(BasePlatformAdapter):
                     original=payload,
                 )
                 if history_video:
-                    merged_video = dict(payload)
-                    merged_video.update(history_video)
+                    merged_video = self._merge_video_payload(payload, history_video)
                     enriched_attachment = dict(attachment)
                     enriched_attachment["video"] = merged_video
                     enriched_attachments.append(enriched_attachment)
@@ -587,8 +644,7 @@ class VKAdapter(BasePlatformAdapter):
                 )
                 items = (video_payload.get("response") or {}).get("items") or []
                 if items and isinstance(items[0], dict):
-                    merged_video = dict(payload)
-                    merged_video.update(items[0])
+                    merged_video = self._merge_video_payload(payload, items[0])
                     enriched_attachment = dict(attachment)
                     enriched_attachment["video"] = merged_video
                     enriched_attachments.append(enriched_attachment)
@@ -603,6 +659,25 @@ class VKAdapter(BasePlatformAdapter):
             enriched_msg["attachments"] = enriched_attachments
             return enriched_msg
         return msg
+
+    @classmethod
+    def _merge_video_payload(cls, original: dict[str, Any], enriched: dict[str, Any]) -> dict[str, Any]:
+        """Merge richer VK video metadata without losing live message previews.
+
+        For message-scoped VK videos, ``video.get`` may add ``player`` and
+        ``is_from_message`` while returning expired ``first_frame``/``image``
+        URLs.  The original message attachment often carries still-downloadable
+        preview URLs.  If the enriched object still has no direct media file,
+        preserve those original previews so Hermes can at least run vision on a
+        frame instead of dropping the attachment.
+        """
+        merged = dict(original)
+        merged.update(enriched)
+        if not cls._video_has_direct_media(merged):
+            for key in ("first_frame", "image", "access_key"):
+                if original.get(key):
+                    merged[key] = original[key]
+        return merged
 
     async def _video_from_history_attachments(
         self,
@@ -667,6 +742,25 @@ class VKAdapter(BasePlatformAdapter):
         if isinstance(files, dict):
             return any(files.get(key) for key in ("mp4_1080", "mp4_720", "mp4_480", "mp4_360", "mp4_240", "external"))
         return False
+
+    @staticmethod
+    def _video_image_url(payload: dict[str, Any]) -> str:
+        """Return the best available preview frame for a video attachment.
+
+        VK message-scoped videos can be visible in the web UI while the API
+        withholds direct ``files``/``url`` media sources.  In that case a
+        ``first_frame``/``image`` preview is still useful context for Hermes and
+        should be routed as an image instead of dropping the attachment entirely.
+        """
+        candidates = []
+        for key in ("first_frame", "image"):
+            value = payload.get(key) or []
+            if isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+        if not candidates:
+            return ""
+        best = max(candidates, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+        return str(best.get("url") or "")
 
     async def _resolve_conversation_context(self, peer_id: str, *, chat_type: str) -> tuple[str, str]:
         """Return a useful VK chat label and browser URL for prompt context.
@@ -788,8 +882,8 @@ class VKAdapter(BasePlatformAdapter):
         if kind == "video":
             # Native media intake must not synthesize or prefer public VK watch
             # pages.  Only return direct file fields obtained from VK API.  If
-            # VK exposes only player/owner/id metadata, the attachment remains a
-            # text-only video marker rather than a fake downloadable media URL.
+            # VK exposes only player/owner/id metadata, fall back to the best
+            # first_frame/image preview so the agent can still see context.
             direct_url = str(payload.get("url") or "")
             if direct_url:
                 return direct_url
@@ -799,7 +893,7 @@ class VKAdapter(BasePlatformAdapter):
                     value = str(files.get(key) or "")
                     if value:
                         return value
-            return ""
+            return VKAdapter._video_image_url(payload)
         if kind == "audio_message":
             return str(payload.get("link_ogg") or payload.get("link_mp3") or "")
         if kind == "video_message":
@@ -818,6 +912,8 @@ class VKAdapter(BasePlatformAdapter):
         if kind == "photo":
             return "image/jpeg"
         if kind in {"video", "video_message"}:
+            if kind == "video" and not VKAdapter._video_has_direct_media(payload) and VKAdapter._video_image_url(payload):
+                return "image/jpeg"
             return "video/mp4"
         if kind == "audio_message":
             return "audio/ogg" if payload.get("link_ogg") else "audio/mpeg"
@@ -935,55 +1031,67 @@ class VKAdapter(BasePlatformAdapter):
 
     async def _send_attachment(self, chat_id: str, attachment: str, caption: Optional[str] = None) -> SendResult:
         try:
-            payload = await self._vk_method(
-                "messages.send",
-                {
-                    "peer_ids": str(chat_id),
-                    "message": caption or "",
-                    "attachment": attachment,
-                    "random_id": random.randint(1, 2_147_483_647),
-                },
-            )
+            async def op():
+                return await self._vk_method(
+                    "messages.send",
+                    {
+                        "peer_ids": str(chat_id),
+                        "message": caption or "",
+                        "attachment": attachment,
+                        "random_id": random.randint(1, 2_147_483_647),
+                    },
+                )
+
+            payload = await _retry_vk_transient_once("messages.send attachment", op)
             message_id = self._sent_message_id(payload)
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
 
     async def _upload_photo_attachment(self, chat_id: str, image_path: str) -> str:
-        server = await self._vk_method("photos.getMessagesUploadServer", {"peer_id": str(chat_id)})
-        upload_url = (server.get("response") or {}).get("upload_url")
-        if not upload_url:
-            raise RuntimeError("VK photo upload server response is missing upload_url")
-        uploaded = await _multipart_upload_async(upload_url, "photo", image_path)
-        saved = await self._vk_method("photos.saveMessagesPhoto", uploaded)
-        photos = saved.get("response") or []
-        if not photos:
-            raise RuntimeError("VK photo save response is empty")
-        return self._format_attachment_ref("photo", photos[0])
+        async def op():
+            server = await self._vk_method("photos.getMessagesUploadServer", {"peer_id": str(chat_id)})
+            upload_url = (server.get("response") or {}).get("upload_url")
+            if not upload_url:
+                raise RuntimeError("VK photo upload server response is missing upload_url")
+            uploaded = await _multipart_upload_async(upload_url, "photo", image_path)
+            saved = await self._vk_method("photos.saveMessagesPhoto", uploaded)
+            photos = saved.get("response") or []
+            if not photos:
+                raise RuntimeError("VK photo save response is empty")
+            return self._format_attachment_ref("photo", photos[0])
+
+        return await _retry_vk_transient_once("photo upload", op)
 
     async def _upload_doc_attachment(self, chat_id: str, file_path: str, *, doc_type: Optional[str] = None) -> str:
-        params = {"peer_id": str(chat_id)}
-        if doc_type:
-            params["type"] = doc_type
-        server = await self._vk_method("docs.getMessagesUploadServer", params)
-        upload_url = (server.get("response") or {}).get("upload_url")
-        if not upload_url:
-            raise RuntimeError("VK docs upload server response is missing upload_url")
-        uploaded = await _multipart_upload_async(upload_url, "file", file_path)
-        saved = await self._vk_method("docs.save", uploaded)
-        response = saved.get("response") or {}
-        doc = response.get("audio_message") or response.get("doc") or response
-        kind = "doc"
-        return self._format_attachment_ref(kind, doc)
+        async def op():
+            params = {"peer_id": str(chat_id)}
+            if doc_type:
+                params["type"] = doc_type
+            server = await self._vk_method("docs.getMessagesUploadServer", params)
+            upload_url = (server.get("response") or {}).get("upload_url")
+            if not upload_url:
+                raise RuntimeError("VK docs upload server response is missing upload_url")
+            uploaded = await _multipart_upload_async(upload_url, "file", file_path)
+            saved = await self._vk_method("docs.save", uploaded)
+            response = saved.get("response") or {}
+            doc = response.get("audio_message") or response.get("doc") or response
+            kind = "doc"
+            return self._format_attachment_ref(kind, doc)
+
+        return await _retry_vk_transient_once("doc upload", op)
 
     async def _upload_video_attachment(self, chat_id: str, video_path: str, caption: Optional[str] = None) -> str:
-        server = await self._vk_method("video.save", {"group_id": self.group_id, "name": caption or Path(video_path).name})
-        response = server.get("response") or {}
-        upload_url = response.get("upload_url")
-        if not upload_url:
-            raise RuntimeError("VK video.save response is missing upload_url")
-        await _multipart_upload_async(upload_url, "video_file", video_path, timeout=300)
-        return self._format_attachment_ref("video", response)
+        async def op():
+            server = await self._vk_method("video.save", {"group_id": self.group_id, "name": caption or Path(video_path).name})
+            response = server.get("response") or {}
+            upload_url = response.get("upload_url")
+            if not upload_url:
+                raise RuntimeError("VK video.save response is missing upload_url")
+            await _multipart_upload_async(upload_url, "video_file", video_path, timeout=300)
+            return self._format_attachment_ref("video", response)
+
+        return await _retry_vk_transient_once("video upload", op)
 
     async def send(
         self,
@@ -1000,14 +1108,17 @@ class VKAdapter(BasePlatformAdapter):
         continuation_ids: list[str] = []
         try:
             for chunk in chunks:
-                payload = await self._vk_method(
-                    "messages.send",
-                    {
-                        "peer_ids": str(chat_id),
-                        "message": chunk,
-                        "random_id": random.randint(1, 2_147_483_647),
-                    },
-                )
+                async def op(chunk=chunk):
+                    return await self._vk_method(
+                        "messages.send",
+                        {
+                            "peer_ids": str(chat_id),
+                            "message": chunk,
+                            "random_id": random.randint(1, 2_147_483_647),
+                        },
+                    )
+
+                payload = await _retry_vk_transient_once("messages.send", op)
                 message_id = self._sent_message_id(payload)
                 if last_message_id:
                     continuation_ids.append(last_message_id)

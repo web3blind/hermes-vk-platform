@@ -933,6 +933,50 @@ async def test_vk_send_attachment_retries_once_on_transient_send_error():
     sleep.assert_awaited_once_with(5.0)
 
 
+def test_vk_format_message_converts_markdown_to_readable_plain_text():
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+
+    formatted = adapter.format_message(
+        "## Заголовок\n"
+        "**Жирный** и *курсив*, ~~зачёркнуто~~, `код`, ||спойлер||.\n"
+        "Ссылка: [пример](https://example.com/path_a).\n"
+        "![обложка](https://example.com/pic.png)\n"
+        "> цитата\n"
+        "```python\nprint('ok')\n```"
+    )
+
+    assert "**" not in formatted
+    assert "```" not in formatted
+    assert "##" not in formatted
+    assert "Заголовок" in formatted
+    assert "Жирный и курсив" in formatted
+    assert "пример (https://example.com/path_a)" in formatted
+    assert "обложка: https://example.com/pic.png" in formatted
+    assert "цитата" in formatted
+    assert "print('ok')" in formatted
+
+
+@pytest.mark.asyncio
+async def test_vk_send_plainifies_markdown_before_messages_send():
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    calls = []
+
+    async def fake_vk_method(method: str, params: dict[str, Any] | None = None, *, access_token: str | None = None):
+        calls.append((method, params, access_token))
+        assert method == "messages.send"
+        assert params is not None
+        assert params["message"] == "Важное: текст (https://example.com)"
+        return {"response": 123}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("2000000042", "**Важное**: [текст](https://example.com)")
+
+    assert result.success is True
+    assert result.message_id == "123"
+    assert calls
+
+
 @pytest.mark.asyncio
 async def test_vk_send_uses_peer_ids_response_cmid_for_editable_progress():
     adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))

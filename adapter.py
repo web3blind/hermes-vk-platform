@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import random
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -315,6 +316,51 @@ def _looks_like_downloadable_attachment_url(url: str) -> bool:
     return True
 
 
+def _markdown_to_vk_plain_text(content: str) -> str:
+    """Convert common Markdown into readable VK plain text.
+
+    VK's regular ``messages.send`` API does not expose Telegram-like
+    ``parse_mode`` for Markdown/HTML. Sending raw agent Markdown makes VK users
+    see literal ``**bold**`` markers, so preserve the words and links while
+    dropping presentation-only markers.
+    """
+    text = str(content or "")
+    if not text:
+        return ""
+
+    # Keep code content but drop fenced-code language/fences.
+    text = re.sub(r"```[ \t]*[A-Za-z0-9_+.#-]*\n?", "", text)
+    text = text.replace("```", "")
+
+    # Markdown images/links become readable text with URL when useful.
+    text = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)", lambda m: f"{m.group(1).strip() or 'изображение'}: {m.group(2)}", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)", lambda m: f"{m.group(1).strip()} ({m.group(2)})", text)
+
+    # Headings and blockquotes are readable without their Markdown markers.
+    text = re.sub(r"(?m)^#{1,6}\s+", "", text)
+    text = re.sub(r"(?m)^>\s?", "", text)
+
+    # Common inline emphasis/decoration markers. Use conservative patterns so
+    # normal underscores inside identifiers/URLs are left alone.
+    replacements = [
+        (r"\*\*\*([^*\n]+)\*\*\*", r"\1"),
+        (r"\*\*([^*\n]+)\*\*", r"\1"),
+        (r"__([^_\n]+)__", r"\1"),
+        (r"~~([^~\n]+)~~", r"\1"),
+        (r"\|\|([^|\n]+)\|\|", r"\1"),
+        (r"`([^`\n]+)`", r"\1"),
+        (r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1"),
+        (r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1"),
+    ]
+    for pattern, repl in replacements:
+        text = re.sub(pattern, repl, text)
+
+    # Telegram-style copyable code blocks may leave indentation intact; that is
+    # fine for VK. Only trim trailing spaces introduced by marker removal.
+    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
 class VKAdapter(BasePlatformAdapter):
     """VK community messages adapter backed by Group Long Poll."""
 
@@ -366,6 +412,9 @@ class VKAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "VK Messenger"
+
+    def format_message(self, content: str) -> str:
+        return _markdown_to_vk_plain_text(content)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token or not self.group_id:

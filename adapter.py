@@ -508,6 +508,9 @@ class VKAdapter(BasePlatformAdapter):
         attachment_summary = self._summarize_attachments(attachments) if attachments else ""
         if attachment_summary:
             text = self._merge_caption(text, attachment_summary)
+        forwarded_summary = self._summarize_forwarded_messages(msg)
+        if forwarded_summary:
+            text = self._merge_caption(text, forwarded_summary)
         if not text and not media_urls:
             return
 
@@ -947,6 +950,52 @@ class VKAdapter(BasePlatformAdapter):
                 return MessageType.VOICE
             return MessageType.DOCUMENT
         return MessageType.TEXT
+
+    def _summarize_forwarded_messages(self, msg: dict[str, Any]) -> str:
+        """Return a compact text representation of VK replies/forwards.
+
+        VK puts forwarded messages in ``fwd_messages`` and replies in
+        ``reply_message``. They are not normal attachments, so without this a
+        pure forward has empty ``text``/``attachments`` and is silently ignored.
+        Keep the summary compact and mark it as quoted context so the agent does
+        not confuse it with the user's own new words.
+        """
+        parts: list[str] = []
+        reply = msg.get("reply_message")
+        if isinstance(reply, dict):
+            rendered = self._render_forwarded_message(reply, depth=0)
+            if rendered:
+                parts.append("[VK reply]\n" + rendered)
+        forwards = msg.get("fwd_messages") or []
+        if isinstance(forwards, list):
+            rendered_forwards = [self._render_forwarded_message(item, depth=0) for item in forwards if isinstance(item, dict)]
+            rendered_forwards = [item for item in rendered_forwards if item]
+            if rendered_forwards:
+                parts.append("[VK forwarded messages]\n" + "\n---\n".join(rendered_forwards[:5]))
+                if len(rendered_forwards) > 5:
+                    parts.append(f"[VK forwarded messages: {len(rendered_forwards) - 5} more omitted]")
+        return "\n\n".join(parts)
+
+    def _render_forwarded_message(self, item: dict[str, Any], *, depth: int) -> str:
+        if depth > 2:
+            return "[nested forwarded messages omitted]"
+        lines: list[str] = []
+        from_id = item.get("from_id")
+        if from_id not in (None, ""):
+            lines.append(f"from_id={from_id}")
+        text = str(item.get("text") or "").strip()
+        if text:
+            lines.append(text)
+        attachments = item.get("attachments") or []
+        if isinstance(attachments, list) and attachments:
+            lines.append(self._summarize_attachments(attachments))
+        nested = item.get("fwd_messages") or []
+        if isinstance(nested, list) and nested:
+            nested_rendered = [self._render_forwarded_message(child, depth=depth + 1) for child in nested if isinstance(child, dict)]
+            nested_rendered = [child for child in nested_rendered if child]
+            if nested_rendered:
+                lines.append("nested forwards:\n" + "\n---\n".join(nested_rendered[:3]))
+        return "\n".join(lines).strip()
 
     def _extract_attachment_media(self, attachments: list[Any]) -> tuple[MessageType, list[str], list[str]]:
         message_type = MessageType.TEXT

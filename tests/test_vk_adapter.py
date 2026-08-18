@@ -404,6 +404,81 @@ async def test_vk_message_new_with_attachment_builds_media_event():
 
 
 @pytest.mark.asyncio
+async def test_vk_pure_forwarded_message_dispatches_context_event():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000001,
+                    "conversation_message_id": 8,
+                    "text": "",
+                    "fwd_messages": [
+                        {
+                            "from_id": 200,
+                            "text": "пересланный смысл",
+                            "attachments": [{"type": "photo", "photo": {"sizes": []}}],
+                        }
+                    ],
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.call_args.args[0]
+    assert "[VK forwarded messages]" in event.text
+    assert "from_id=200" in event.text
+    assert "пересланный смысл" in event.text
+    assert "фото" in event.text
+
+
+@pytest.mark.asyncio
+async def test_vk_forwarded_message_with_comment_preserves_both_layers():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000001,
+                    "conversation_message_id": 9,
+                    "text": "мой комментарий",
+                    "reply_message": {"from_id": 300, "text": "исходное сообщение"},
+                    "fwd_messages": [{"from_id": 200, "text": "пересланный смысл"}],
+                }
+            },
+        }
+    )
+
+    event = adapter.handle_message.call_args.args[0]
+    assert event.text.startswith("мой комментарий")
+    assert "[VK reply]" in event.text
+    assert "исходное сообщение" in event.text
+    assert "[VK forwarded messages]" in event.text
+    assert "пересланный смысл" in event.text
+
+
+@pytest.mark.asyncio
 async def test_vk_materializes_direct_media_urls_for_gateway_processors():
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
 

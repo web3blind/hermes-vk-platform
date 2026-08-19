@@ -552,6 +552,12 @@ class VKAdapter(BasePlatformAdapter):
         text = str(msg.get("text") or "").strip()
         attachments = msg.get("attachments") or []
         media_type, media_urls, media_types = self._extract_attachment_media(attachments)
+        nested_media_type, nested_media_urls, nested_media_types = self._extract_nested_message_media(msg)
+        if nested_media_urls:
+            if media_type == MessageType.TEXT and nested_media_type != MessageType.TEXT:
+                media_type = nested_media_type
+            media_urls.extend(nested_media_urls)
+            media_types.extend(nested_media_types)
         if media_urls:
             media_urls = await self._materialize_inbound_media(media_type, media_urls, media_types)
         attachment_summary = self._summarize_attachments(attachments) if attachments else ""
@@ -1045,6 +1051,50 @@ class VKAdapter(BasePlatformAdapter):
             if nested_rendered:
                 lines.append("nested forwards:\n" + "\n---\n".join(nested_rendered[:3]))
         return "\n".join(lines).strip()
+
+    def _extract_nested_message_media(self, msg: dict[str, Any]) -> tuple[MessageType, list[str], list[str]]:
+        """Return media URLs attached to VK replies/forwarded messages.
+
+        Top-level message attachments are handled separately.  VK stores media
+        inside ``reply_message`` and ``fwd_messages`` when a user replies to or
+        forwards a message; those nested attachments must still become
+        ``MessageEvent.media_urls`` so downstream image/audio/video processors can
+        inspect them.  The textual forwarded summary remains quoted context.
+        """
+        message_type = MessageType.TEXT
+        media_urls: list[str] = []
+        media_types: list[str] = []
+
+        def visit(item: dict[str, Any], *, depth: int) -> None:
+            nonlocal message_type
+            if depth > 2 or len(media_urls) >= 10:
+                return
+            attachments = item.get("attachments") or []
+            if isinstance(attachments, list) and attachments:
+                current_type, current_urls, current_media_types = self._extract_attachment_media(attachments)
+                if message_type == MessageType.TEXT and current_type != MessageType.TEXT:
+                    message_type = current_type
+                remaining = max(0, 10 - len(media_urls))
+                media_urls.extend(current_urls[:remaining])
+                media_types.extend(current_media_types[:remaining])
+            reply = item.get("reply_message")
+            if isinstance(reply, dict):
+                visit(reply, depth=depth + 1)
+            forwards = item.get("fwd_messages") or []
+            if isinstance(forwards, list):
+                for child in forwards[:5]:
+                    if isinstance(child, dict):
+                        visit(child, depth=depth + 1)
+
+        reply = msg.get("reply_message")
+        if isinstance(reply, dict):
+            visit(reply, depth=0)
+        forwards = msg.get("fwd_messages") or []
+        if isinstance(forwards, list):
+            for item in forwards[:5]:
+                if isinstance(item, dict):
+                    visit(item, depth=0)
+        return message_type, media_urls, media_types
 
     def _extract_attachment_media(self, attachments: list[Any]) -> tuple[MessageType, list[str], list[str]]:
         message_type = MessageType.TEXT

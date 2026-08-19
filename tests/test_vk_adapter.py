@@ -441,6 +441,110 @@ async def test_vk_pure_forwarded_message_dispatches_context_event():
     assert "from_id=200" in event.text
     assert "пересланный смысл" in event.text
     assert "фото" in event.text
+    assert event.message_type is MessageType.TEXT
+    assert event.media_urls == []
+
+
+@pytest.mark.asyncio
+async def test_vk_forwarded_photo_with_comment_routes_media_url():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    with patch("adapter._download_attachment_async", AsyncMock(return_value="/tmp/forwarded-photo.jpg")) as download:
+        await adapter._handle_update(
+            {
+                "type": "message_new",
+                "object": {
+                    "message": {
+                        "from_id": 100,
+                        "peer_id": 2000000001,
+                        "conversation_message_id": 10,
+                        "text": "посмотри фото",
+                        "fwd_messages": [
+                            {
+                                "from_id": 200,
+                                "text": "",
+                                "attachments": [
+                                    {
+                                        "type": "photo",
+                                        "photo": {
+                                            "sizes": [
+                                                {"width": 10, "height": 10, "url": "https://vk.example/small.jpg"},
+                                                {"width": 100, "height": 100, "url": "https://vk.example/big.jpg"},
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.call_args.args[0]
+    assert event.text.startswith("посмотри фото")
+    assert "[VK forwarded messages]" in event.text
+    assert "[VK attachment: фото]" in event.text
+    assert event.message_type is MessageType.PHOTO
+    assert event.media_urls == ["/tmp/forwarded-photo.jpg"]
+    assert event.media_types == ["image/jpeg"]
+    download.assert_awaited_once_with("https://vk.example/big.jpg", "image/jpeg", max_bytes=26214400)
+
+
+@pytest.mark.asyncio
+async def test_vk_reply_photo_routes_media_url():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    with patch("adapter._download_attachment_async", AsyncMock(return_value="/tmp/reply-photo.jpg")) as download:
+        await adapter._handle_update(
+            {
+                "type": "message_new",
+                "object": {
+                    "message": {
+                        "from_id": 100,
+                        "peer_id": 2000000001,
+                        "conversation_message_id": 11,
+                        "text": "что на этом фото?",
+                        "reply_message": {
+                            "from_id": 200,
+                            "text": "",
+                            "attachments": [
+                                {
+                                    "type": "photo",
+                                    "photo": {
+                                        "sizes": [
+                                            {"width": 100, "height": 60, "url": "https://vk.example/reply.jpg"}
+                                        ]
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                },
+            }
+        )
+
+    event = adapter.handle_message.call_args.args[0]
+    assert "[VK reply]" in event.text
+    assert event.message_type is MessageType.PHOTO
+    assert event.media_urls == ["/tmp/reply-photo.jpg"]
+    assert event.media_types == ["image/jpeg"]
+    download.assert_awaited_once_with("https://vk.example/reply.jpg", "image/jpeg", max_bytes=26214400)
 
 
 @pytest.mark.asyncio

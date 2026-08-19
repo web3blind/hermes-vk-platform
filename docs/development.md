@@ -39,7 +39,7 @@ ctx.register_platform(
 
 ```text
 VK Group Long Poll
-  -> message_new event
+  -> message_new or message_edit event
   -> VKAdapter parses peer_id / from_id / text / attachments
   -> adapter allowlist check
   -> MessageEvent(source.platform='vk', chat_id=peer_id, user_id=from_id)
@@ -47,6 +47,8 @@ VK Group Long Poll
   -> VKAdapter.send(...)
   -> VK messages.send
 ```
+
+`message_edit` is intentionally mapped to a normal inbound `MessageEvent` in the same VK session. After the original run finishes, an edited VK message therefore behaves like a follow-up turn. While a run is active, the gateway's normal busy-input policy decides whether the edit is queued/steered. Community/bot-origin edits are ignored to avoid loops from Hermes progress-message edits.
 
 Tool progress uses:
 

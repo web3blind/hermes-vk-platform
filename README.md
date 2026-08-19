@@ -6,7 +6,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 
 ## Features
 
-- Inbound VK `message_new` events through Group Long Poll.
+- Inbound VK `message_new` and `message_edit` events through Group Long Poll.
 - Outbound replies with `messages.send`.
 - Direct messages and VK group conversations (`peer_id = 2000000000 + chat_id`).
 - Safe allowlist controls for VK users, peers, and peer+user policies.
@@ -15,6 +15,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Message editing for Hermes tool-progress bubbles through `messages.edit`.
 - Inbound media handling for photos, documents, voice messages, audio, video messages, and direct video files with bounded downloads.
 - Outbound media upload for image files, documents, voice files, and videos.
+- If VK `video.save` rejects an MP4 with auth/permission errors under group-token auth, video delivery falls back to sending the MP4 as a document attachment.
 - Markdown-style Hermes output is converted to VK-readable plain text because the regular VK `messages.send` API has no Telegram-like `parse_mode` for Markdown/HTML.
 - Optional per-channel prompts and skill bindings through Hermes config.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
@@ -56,7 +57,7 @@ If you prefer manual setup, edit `~/.hermes/.env` as shown below.
 2. Open community settings and enable community messages.
 3. Enable bot capabilities / allow messages from users.
 4. Enable Long Poll API for the community.
-5. Enable the `message_new` event type.
+5. Enable the `message_new` and `message_edit` event types.
 6. Create a community token with `messages` permission.
 7. If using group conversations, allow adding the community bot to chats and add it to the target chat.
 8. Configure allowlists before starting the gateway.

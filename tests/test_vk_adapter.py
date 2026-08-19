@@ -360,6 +360,102 @@ async def test_vk_message_new_duplicate_is_ignored_before_enrichment_and_downloa
 
 
 @pytest.mark.asyncio
+async def test_vk_message_edit_dispatches_as_followup_event():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    await adapter._handle_update(
+        {
+            "type": "message_edit",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000001,
+                    "conversation_message_id": 8,
+                    "text": "дописанный текст после завершения",
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.call_args.args[0]
+    assert event.text == "дописанный текст после завершения"
+    assert event.message_id == "8"
+    assert event.source.chat_id == "2000000001"
+
+
+@pytest.mark.asyncio
+async def test_vk_message_edit_duplicate_same_text_is_ignored_but_changed_text_dispatches():
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "allowed_peers": ["2000000001"]},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+
+    base = {
+        "type": "message_edit",
+        "object": {
+            "message": {
+                "from_id": 100,
+                "peer_id": 2000000001,
+                "conversation_message_id": 8,
+                "text": "первая редакция",
+            }
+        },
+    }
+    await adapter._handle_update(base)
+    await adapter._handle_update(base)
+    changed = {
+        "type": "message_edit",
+        "object": {
+            "message": {
+                "from_id": 100,
+                "peer_id": 2000000001,
+                "conversation_message_id": 8,
+                "text": "вторая редакция",
+            }
+        },
+    }
+    await adapter._handle_update(changed)
+
+    assert adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_vk_message_edit_from_community_echo_is_ignored():
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789", "allowed_peers": ["2000000001"]}))
+    adapter.handle_message = AsyncMock()
+    adapter._vk_method = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_edit",
+            "object": {
+                "message": {
+                    "from_id": -123456789,
+                    "peer_id": 2000000001,
+                    "conversation_message_id": 9,
+                    "text": "progress edited",
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._vk_method.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_vk_message_new_with_attachment_builds_media_event():
     adapter = VKAdapter(
         PlatformConfig(
@@ -951,6 +1047,57 @@ async def test_vk_send_image_file_uploads_and_sends_attachment(tmp_path):
 
     assert result.success is True
     assert result.message_id == "123"
+
+
+@pytest.mark.asyncio
+async def test_vk_send_video_falls_back_to_document_when_video_save_needs_user_auth(tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake mp4")
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    calls = []
+
+    async def fake_vk_method(method, params=None):
+        calls.append((method, params))
+        if method == "video.save":
+            raise RuntimeError("VK API error 5: User authorization failed")
+        if method == "docs.getMessagesUploadServer":
+            assert params == {"peer_id": "2000000001"}
+            return {"response": {"upload_url": "https://upload.example/doc"}}
+        if method == "docs.save":
+            return {"response": {"doc": {"owner_id": -123456789, "id": 33, "access_key": "ak"}}}
+        if method == "messages.send":
+            assert params is not None
+            assert params["attachment"] == "doc-123456789_33_ak"
+            assert params["message"] == "caption"
+            return {"response": 123}
+        raise AssertionError(method)
+
+    adapter._vk_method = fake_vk_method
+    with patch("adapter._multipart_upload_async", AsyncMock(return_value={"file": "server-payload"})) as upload:
+        result = await adapter.send_video("2000000001", str(video), caption="caption")
+
+    assert result.success is True
+    assert result.message_id == "123"
+    assert [method for method, _params in calls] == [
+        "video.save",
+        "docs.getMessagesUploadServer",
+        "docs.save",
+        "messages.send",
+    ]
+    upload.assert_awaited_once_with("https://upload.example/doc", "file", str(video))
+
+
+@pytest.mark.asyncio
+async def test_vk_send_video_preserves_non_auth_video_upload_errors(tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake mp4")
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    adapter._vk_method = AsyncMock(side_effect=RuntimeError("VK video.save response is missing upload_url"))
+
+    result = await adapter.send_video("2000000001", str(video), caption="caption")
+
+    assert result.success is False
+    assert "missing upload_url" in (result.error or "")
 
 
 def test_vk_retryable_error_classifier_is_narrow():

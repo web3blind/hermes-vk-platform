@@ -175,6 +175,18 @@ async def _multipart_upload_async(url: str, field_name: str, file_path: str, *, 
     return await asyncio.to_thread(_multipart_upload, url, field_name, file_path, timeout=timeout)
 
 
+def _is_vk_auth_or_permission_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "vk api error 5" in text
+        or "user authorization failed" in text
+        or "vk api error 7" in text
+        or "permission" in text
+        or "vk api error 15" in text
+        or "access denied" in text
+    )
+
+
 def _is_retryable_vk_error(exc: Exception) -> bool:
     """Return whether an outbound VK failure is worth one delayed retry.
 
@@ -408,6 +420,7 @@ class VKAdapter(BasePlatformAdapter):
         self._lock_key: Optional[str] = None
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
         self._seen_message_keys: dict[str, float] = {}
+        self._seen_edit_keys: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -526,14 +539,16 @@ class VKAdapter(BasePlatformAdapter):
                     pass
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
-        if update.get("type") != "message_new":
+        update_type = str(update.get("type") or "")
+        if update_type not in {"message_new", "message_edit"}:
             return
         obj = update.get("object") or {}
         msg = obj.get("message") or obj
         if not isinstance(msg, dict):
             return
 
-        # VK uses from_id < 0 for communities. Ignore bot/community echoes.
+        # VK uses from_id < 0 for communities. Ignore bot/community echoes,
+        # including our own progress-message edits delivered as message_edit.
         from_id = str(msg.get("from_id") or "")
         if from_id.startswith("-"):
             return
@@ -544,9 +559,14 @@ class VKAdapter(BasePlatformAdapter):
             return
 
         conversation_message_id = msg.get("conversation_message_id") or msg.get("id")
-        if self._is_duplicate_event(peer_id=peer_id, conversation_message_id=conversation_message_id):
-            logger.info("VK: ignoring duplicate event peer=%s cmid=%s", peer_id, conversation_message_id)
-            return
+        if update_type == "message_new":
+            if self._is_duplicate_event(peer_id=peer_id, conversation_message_id=conversation_message_id):
+                logger.info("VK: ignoring duplicate event peer=%s cmid=%s", peer_id, conversation_message_id)
+                return
+        else:
+            if self._is_duplicate_edit_event(peer_id=peer_id, conversation_message_id=conversation_message_id, msg=msg):
+                logger.info("VK: ignoring duplicate edit event peer=%s cmid=%s", peer_id, conversation_message_id)
+                return
         msg = await self._enrich_message_from_api(msg, peer_id=peer_id, conversation_message_id=conversation_message_id)
 
         text = str(msg.get("text") or "").strip()
@@ -905,6 +925,31 @@ class VKAdapter(BasePlatformAdapter):
         if key in self._seen_message_keys:
             return True
         self._seen_message_keys[key] = now + self.dedupe_ttl_seconds
+        return False
+
+    def _is_duplicate_edit_event(self, *, peer_id: str, conversation_message_id: Any, msg: dict[str, Any]) -> bool:
+        if not peer_id or conversation_message_id in (None, "") or self.dedupe_ttl_seconds <= 0:
+            return False
+        now = time.monotonic()
+        expired = [key for key, expires_at in self._seen_edit_keys.items() if expires_at <= now]
+        for key in expired:
+            self._seen_edit_keys.pop(key, None)
+        text = str(msg.get("text") or "")
+        attachments = msg.get("attachments") or []
+        forwards = msg.get("fwd_messages") or []
+        reply = msg.get("reply_message") or None
+        digest = hashlib.sha256(
+            json.dumps(
+                {"text": text, "attachments": attachments, "reply_message": reply, "fwd_messages": forwards},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        key = f"{peer_id}:{conversation_message_id}:{digest}"
+        if key in self._seen_edit_keys:
+            return True
+        self._seen_edit_keys[key] = now + self.dedupe_ttl_seconds
         return False
 
     def _is_authorized(self, *, from_id: str, peer_id: str) -> bool:
@@ -1375,7 +1420,19 @@ class VKAdapter(BasePlatformAdapter):
         try:
             attachment = await self._upload_video_attachment(chat_id, video_path, caption)
         except Exception as exc:
-            return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
+            if not _is_vk_auth_or_permission_error(exc):
+                return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
+            logger.info(
+                "VK: video.save is not available with current auth; sending video as document attachment instead"
+            )
+            try:
+                attachment = await self._upload_doc_attachment(chat_id, video_path)
+            except Exception as doc_exc:
+                return SendResult(
+                    success=False,
+                    error=_redact_token(f"video upload failed: {exc}; document fallback failed: {doc_exc}"),
+                    retryable=True,
+                )
         return await self._send_attachment(chat_id, attachment, caption)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:

@@ -2,7 +2,7 @@ manifest_version: 1
 name: vk-platform
 label: VK Messenger
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   VK Messenger gateway adapter for Hermes Agent. Uses VK community messages
   and Group Long Poll to relay messages between VK chats and Hermes.

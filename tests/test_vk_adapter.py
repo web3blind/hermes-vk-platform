@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
@@ -8,15 +10,26 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
 from gateway.session import SessionSource, build_session_key
-from adapter import (
+from plugins.platforms.vk.adapter import (
     VKAdapter,
     _download_attachment,
     _apply_yaml_config,
     _env_enablement,
+    _format_lane_yaml_snippet,
     _is_retryable_vk_error,
+    _is_safe_lane_id,
+    _load_lane_state,
+    _normalize_project_lanes,
+    _parse_project_create_text,
+    _parse_project_new_fallback,
+    _parse_vk_target_ref,
     _looks_like_downloadable_attachment_url,
     _split_csv,
+    _standalone_send,
+    _upsert_lane_in_config,
+    _vk_api_error_message,
 )
+from plugins.platforms.vk.setup_helper import import_project_lanes_to_vk
 
 
 @pytest.fixture(autouse=True)
@@ -37,11 +50,25 @@ def clear_vk_env(monkeypatch):
         "VK_MAX_ATTACHMENT_BYTES",
     ):
         monkeypatch.delenv(key, raising=False)
+    # VK project-lane creation/editing can persist to config by design. Tests
+    # must never mutate the real ~/.hermes/config.yaml; individual tests that
+    # assert config persistence override these fakes with their own captures.
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda *_args, **_kwargs: None)
 
 
 def test_split_csv_accepts_strings_and_iterables():
     assert _split_csv("1, 2,,3 ") == {"1", "2", "3"}
     assert _split_csv(["4", 5, ""]) == {"4", "5"}
+
+
+def test_vk_api_error_912_includes_chat_bot_settings_hint():
+    message = _vk_api_error_message(912, "This is a chat bot feature, change this status in settings")
+
+    assert "VK API error 912" in message
+    assert "chat-bot-only feature" in message
+    assert "work in chats" in message
+    assert "restart the Hermes gateway" in message
 
 
 def test_vk_adapter_denies_by_default_and_allows_explicit_users_or_peers():
@@ -234,6 +261,184 @@ def test_yaml_config_bridges_vk_channel_prompts_and_skill_bindings():
     }
 
 
+def test_project_lanes_config_is_normalized_and_bridged(monkeypatch):
+    platform_cfg = SimpleNamespace(token=None)
+
+    extra = _apply_yaml_config(
+        {
+            "vk": {
+                "project_lanes": {
+                    2000000042: {
+                        "base_folder": "ai-projects",
+                        "default_skill": "coding",
+                        "lanes": [
+                            {
+                                "id": "tccc-ai",
+                                "name": "TCCC AI\nInjected",
+                                "description": "ИИ-аудит web3 проектов",
+                                "folder": "tccc-ai",
+                                "workdir": "/home/assistent/ai-projects/tccc-ai",
+                                "skills": ["tccc-ai-product-development", "coding", "coding"],
+                                "aliases": ["tccc", "аудит"],
+                            },
+                            {"id": "bad/id", "name": "Bad"},
+                        ],
+                    }
+                }
+            }
+        },
+        platform_cfg,
+    )
+
+    lanes = extra["project_lanes"]
+    assert set(lanes) == {"2000000042"}
+    peer = lanes["2000000042"]
+    assert peer["default_skills"] == ["coding"]
+    assert peer["lanes"][0]["id"] == "tccc-ai"
+    assert peer["lanes"][0]["name"] == "TCCC AI Injected"
+    assert peer["lanes"][0]["skills"] == ["tccc-ai-product-development", "coding"]
+    assert peer["alias_to_id"]["tccc"] == "tccc-ai"
+    assert "bad/id" not in peer["lane_by_id"]
+
+
+def test_canonical_platform_project_lanes_config_is_bridged():
+    platform_cfg = SimpleNamespace(token=None)
+
+    extra = _apply_yaml_config(
+        {
+            "platforms": {
+                "vk": {
+                    "extra": {
+                        "project_lanes": {
+                            "enabled": True,
+                            "chats": {"2000000042": {"lanes": [{"id": "vk-plugin", "name": "VK Plugin"}]}},
+                        }
+                    }
+                }
+            }
+        },
+        platform_cfg,
+    )
+
+    assert extra is not None
+    assert extra["project_lanes"]["2000000042"]["lanes"][0]["id"] == "vk-plugin"
+
+
+def test_upsert_lane_in_config_writes_canonical_project_lanes():
+    cfg = {"vk": {"project_lanes": {"legacy": {"lanes": []}}}}
+    _upsert_lane_in_config(
+        cfg,
+        "2000000042",
+        {"id": "gito", "name": "Gito", "workdir": "/tmp/gito", "skills": ["coding"], "aliases": ["gito"]},
+    )
+
+    lanes = cast(dict[str, Any], cfg["platforms"])["vk"]["extra"]["project_lanes"]["chats"]["2000000042"]["lanes"]
+    assert lanes == [{"id": "gito", "name": "Gito", "workdir": "/tmp/gito", "skills": ["coding"], "aliases": ["gito"]}]
+
+
+@pytest.mark.asyncio
+async def test_project_new_persists_lane_to_canonical_config(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    saved = {}
+
+    def fake_load_config():
+        return {}
+
+    def fake_save_config(cfg, **_kwargs):
+        saved.update(cfg)
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+    monkeypatch.setattr("hermes_cli.config.save_config", fake_save_config)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+
+    assert await adapter._add_custom_lane("2000000042", {"id": "gito", "name": "Gito", "skills": ["coding"]}) is True
+
+    lanes = saved["platforms"]["vk"]["extra"]["project_lanes"]["chats"]["2000000042"]["lanes"]
+    assert lanes[0]["id"] == "gito"
+    resolved = adapter._resolve_lane("2000000042", "gito")
+    assert resolved is not None
+    assert resolved["name"] == "Gito"
+
+
+def test_vk_lanes_importer_promotes_legacy_and_telegram_topics(monkeypatch):
+    cfg = {
+        "vk": {"project_lanes": {"2000000001": {"lanes": [{"id": "legacy", "name": "Legacy", "skills": ["coding"]}]}}},
+        "platforms": {
+            "telegram": {
+                "extra": {
+                    "group_topics": [
+                        {"chat_id": "-1001234567890", "topics": [{"id": "tg-topic", "name": "TG Topic", "thread_id": 42, "workdir": "/tmp/tg"}]}
+                    ],
+                    "dm_topics": [
+                        {"chat_id": "-100", "topics": [{"id": "dm-topic", "name": "DM Topic", "thread_id": 43}]}
+                    ]
+                }
+            }
+        },
+    }
+    saved = {}
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda new_cfg, **_kwargs: saved.update(new_cfg))
+
+    report = import_project_lanes_to_vk("2000000042", sources=["legacy", "telegram"], telegram_chat_id="-1001234567890")
+
+    lanes = saved["platforms"]["vk"]["extra"]["project_lanes"]["chats"]["2000000042"]["lanes"]
+    ids = {lane["id"] for lane in lanes}
+    assert report["imported"] == 2
+    assert ids == {"legacy", "tg-topic"}
+
+
+def test_project_lane_id_validation_rejects_session_and_path_unsafe_values():
+    assert _is_safe_lane_id("tccc-ai") is True
+    for value in ("", "bad/id", "bad:id", "bad id", "../bad", "bad\\id"):
+        assert _is_safe_lane_id(value) is False
+
+
+def test_vk_target_parser_accepts_project_lane_thread_target():
+    assert _parse_vk_target_ref("2000000042") == ("2000000042", None)
+    assert _parse_vk_target_ref("2000000042:lane:topic-42") == ("2000000042", "lane:topic-42")
+    assert _parse_vk_target_ref("2000000042:lane:bad/id") is None
+
+
+def test_corrupt_project_lane_state_fails_open(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("{not-json", encoding="utf-8")
+
+    assert _load_lane_state(path) == {"active": {}, "pending_create": {}, "pending_edit": {}, "custom_lanes": {}, "project_list_messages": {}, "project_list_pages": {}, "message_lanes": {}, "pinned": {}}
+
+
+def test_project_new_fast_fallback_parses_name_skills_and_context():
+    lane = _parse_project_new_fallback("Rialo blockchain-project-research,coding ретродроп и аналитика")
+
+    assert lane == {
+        "id": "rialo",
+        "name": "Rialo",
+        "description": "ретродроп и аналитика",
+        "folder": "rialo",
+        "skills": ["blockchain-project-research", "coding"],
+    }
+    snippet = _format_lane_yaml_snippet(lane)
+    assert "id: rialo" in snippet
+    assert "- blockchain-project-research" in snippet
+
+
+def test_project_create_text_parses_labeled_and_freeform_inputs():
+    labeled = _parse_project_create_text(
+        "Название: Rialo\nНазначение: ретродроп и аналитика\nПапка: rialo\nСкиллы: blockchain-project-research, coding"
+    )
+    assert labeled is not None
+    assert labeled["id"] == "rialo"
+    assert labeled["skills"] == ["blockchain-project-research", "coding"]
+
+    freeform = _parse_project_create_text(
+        "Создай проект Rialo для ретродропа и аналитики. Папка rialo. Скиллы blockchain-project-research, coding."
+    )
+    assert freeform is not None
+    assert freeform["id"] == "rialo"
+    assert "blockchain-project-research" in freeform["skills"]
+
+
 def test_vk_attachment_extraction_covers_required_inbound_formats():
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
     attachments = [
@@ -328,6 +533,870 @@ def test_vk_video_merge_preserves_original_preview_when_enrichment_has_no_file()
     assert merged["is_from_message"] == 1
     assert merged["access_key"] == "ak"
     assert merged["first_frame"] == original["first_frame"]
+
+
+@pytest.mark.asyncio
+async def test_project_lane_active_selection_routes_message_as_thread(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {
+                                "id": "tccc-ai",
+                                "name": "TCCC AI",
+                                "description": "audit context",
+                                "skills": ["tccc-ai-product-development", "coding"],
+                                "aliases": ["tccc"],
+                            }
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+    await adapter._set_active_lane_id("2000000042", "100", "tccc-ai")
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 10,
+                    "text": "сделай аудит",
+                }
+            },
+        }
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "lane:tccc-ai"
+    assert event.source.chat_topic == "TCCC AI"
+    assert event.auto_skill == ["tccc-ai-product-development", "coding"]
+    assert "audit context" in event.channel_prompt
+    assert build_session_key(event.source) == "agent:main:vk:thread:2000000042:lane:tccc-ai"
+
+
+@pytest.mark.asyncio
+async def test_project_alias_one_shot_routes_without_changing_active_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [{"id": "tccc-ai", "name": "TCCC AI", "aliases": ["tccc"]}]
+                    }
+                },
+            },
+        )
+    )
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 11, "text": "@tccc задача"}},
+        }
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "задача"
+    assert event.source.thread_id == "lane:tccc-ai"
+    assert adapter._get_active_lane_id("2000000042", "100") is None
+
+
+@pytest.mark.asyncio
+async def test_project_command_is_consumed_before_gateway_slash_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 12, "text": "/project list"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    send_calls = [call[1] for call in calls if call[0] == "messages.send"]
+    assert any("keyboard" in params for params in send_calls)
+    assert any("TCCC AI: /project tccc-ai" in params.get("message", "") for params in send_calls)
+    assert any("Если кнопки видны" in params.get("message", "") for params in send_calls)
+
+
+@pytest.mark.asyncio
+async def test_project_menu_button_with_bot_mention_and_payload_shows_inline_project_list(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 13,
+                    "text": "@club123456789 Проекты",
+                    "payload": json.dumps({"vkpl": "list"}),
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert any("TCCC AI: /project tccc-ai" in params.get("message", "") for params in send_calls)
+    keyboard = json.loads(send_calls[-1]["keyboard"])
+    assert keyboard["inline"] is True
+    assert any(button["action"].get("label") == "TCCC AI" for row in keyboard["buttons"] for button in row)
+
+
+@pytest.mark.asyncio
+async def test_project_menu_button_with_bot_mention_without_payload_still_shows_list(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 14, "text": "@club123456789 Проекты"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert any("TCCC AI: /project tccc-ai" in params.get("message", "") for params in send_calls)
+
+
+@pytest.mark.asyncio
+async def test_invite_command_returns_current_vk_chat_invite_without_agent_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]})
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        if method == "messages.getInviteLink":
+            return {"response": {"link": "https://vk.me/join/testInvite"}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 12, "text": "/invite"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    invite_calls = [params for method, params in calls if method == "messages.getInviteLink"]
+    assert invite_calls == [{"peer_id": "2000000042", "reset": 0}]
+    assert any("https://vk.me/join/testInvite" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+@pytest.mark.asyncio
+async def test_invite_command_in_dm_returns_safe_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["12345"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 12345, "conversation_message_id": 12, "text": "/invite"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert not any(method == "messages.getInviteLink" for method, _params in calls)
+    assert any("только в VK-чате" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+@pytest.mark.asyncio
+async def test_commands_button_shows_vk_command_list_without_agent_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 12, "text": "Команды", "payload": json.dumps({"vkpl": "commands"})}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert any("Команды VK-чата" in params.get("message", "") for params in send_calls)
+    assert any("/invite" in params.get("message", "") for params in send_calls)
+    keyboard = json.loads(send_calls[-1]["keyboard"])
+    labels = [button["action"].get("label") for row in keyboard["buttons"] for button in row]
+    assert keyboard["inline"] is True
+    assert "/project list" in labels
+    assert "/project new" in labels
+    assert "/project edit" in labels
+    assert "/invite" in labels
+
+
+@pytest.mark.asyncio
+async def test_commands_inline_invite_button_executes_invite_without_agent_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        if method == "messages.getInviteLink":
+            return {"response": {"link": "https://vk.me/join/testInvite"}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 13,
+                    "text": "/invite",
+                    "payload": json.dumps({"vkpl": "cmd", "cmd": "/invite"}),
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert any(method == "messages.getInviteLink" for method, _params in calls)
+    assert any("https://vk.me/join/testInvite" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+@pytest.mark.asyncio
+async def test_project_list_next_label_fallback_uses_saved_page_state(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [{"id": f"project-{i}", "name": f"Project {i}"} for i in range(12)]
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000042"], "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+    adapter._lane_state.setdefault("project_list_messages", {})["2000000042:100"] = "cmid:55"
+    adapter._lane_state.setdefault("project_list_pages", {})["2000000042:100"] = 0
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        if method == "messages.edit":
+            return {"response": 1}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 13, "text": "Следующая"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    assert len(edit_calls) == 1
+    assert "Project 11: /project project-11" in edit_calls[0]["message"]
+    assert adapter._lane_state["project_list_pages"]["2000000042:100"] == 1
+
+
+@pytest.mark.asyncio
+async def test_project_list_number_command_shows_requested_page(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [{"id": f"project-{i}", "name": f"Project {i}"} for i in range(12)]
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000042"], "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 14, "text": "/project list 2"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert any("Project 11: /project project-11" in params.get("message", "") for params in send_calls)
+    keyboard = json.loads(send_calls[-1]["keyboard"])
+    labels = [button["action"].get("label") for row in keyboard["buttons"] for button in row]
+    assert "Предыдущая" in labels
+
+
+@pytest.mark.asyncio
+async def test_project_list_number_edits_previous_list_message_when_possible(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [{"id": f"project-{i}", "name": f"Project {i}"} for i in range(12)]
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000042"], "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+    adapter._lane_state.setdefault("project_list_messages", {})["2000000042:100"] = "cmid:55"
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        if method == "messages.edit":
+            return {"response": 1}
+        raise AssertionError(method)
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 15, "text": "/project list 2"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert len(edit_calls) == 1
+    assert send_calls == []
+    assert edit_calls[0]["conversation_message_id"] == "55"
+    assert "Project 11: /project project-11" in edit_calls[0]["message"]
+    keyboard = json.loads(edit_calls[0]["keyboard"])
+    labels = [button["action"].get("label") for row in keyboard["buttons"] for button in row]
+    assert "Предыдущая" in labels
+
+
+@pytest.mark.asyncio
+async def test_project_text_button_selects_lane_without_agent_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 13,
+                    "text": "TCCC AI",
+                    "payload": json.dumps({"vkpl": "select", "id": "tccc-ai"}),
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._get_active_lane_id("2000000042", "100") == "tccc-ai"
+    assert any("Проект выбран: TCCC AI" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+def test_project_list_inline_text_keyboard_keeps_visible_labels_without_color(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+
+    keyboard = json.loads(adapter._project_list_keyboard("2000000042"))
+    flat_buttons = [button for row in keyboard["buttons"] for button in row]
+    project_button = next(button for button in flat_buttons if button["action"].get("label") == "TCCC AI")
+
+    assert keyboard["inline"] is True
+    assert project_button["action"]["type"] == "text"
+    assert json.loads(project_button["action"]["payload"])["id"] == "tccc-ai"
+    assert all("color" not in button for button in flat_buttons)
+    resolved = adapter._resolve_lane("2000000042", "TCCC AI")
+    assert resolved is not None
+    assert resolved["id"] == "tccc-ai"
+
+
+def test_project_list_keyboard_shows_twenty_projects_without_callback_pagination(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [{"id": "hermes-vk-plugin", "name": "Hermes VK-плагин"}]
+    lanes.extend({"id": f"project-{i}", "name": f"Project {i}"} for i in range(19))
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000042"], "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+
+    keyboard = json.loads(adapter._project_list_keyboard("2000000042"))
+    flat_buttons = [button for row in keyboard["buttons"] for button in row]
+    labels = [button["action"].get("label") for button in flat_buttons]
+
+    assert "Hermes VK-плагин" in labels
+    assert "Далее" not in labels
+    assert "Следующая" in labels
+    next_payload = json.loads(next(button for button in flat_buttons if button["action"].get("label") == "Следующая")["action"]["payload"])
+    assert next_payload["cmd"] == "/project list 2"
+    assert len(flat_buttons) == 9
+    assert len(keyboard["buttons"]) <= 3
+    assert all(button["action"]["type"] == "text" for button in flat_buttons)
+
+    page_two = json.loads(adapter._project_list_keyboard("2000000042", page=1))
+    page_two_labels = [button["action"].get("label") for row in page_two["buttons"] for button in row]
+    assert "Предыдущая" in page_two_labels
+    assert "Следующая" in page_two_labels
+    assert "Далее" not in page_two_labels
+
+    text = adapter._project_list_text("2000000042")
+    assert "Project 18" in text
+    assert "Кнопками показаны первые 8 проектов" in text
+
+
+def test_project_list_sorts_lanes_by_latest_thread_session(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [
+        {"id": "old", "name": "Old"},
+        {"id": "new", "name": "New"},
+        {"id": "never", "name": "Never"},
+    ]
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE sessions (source TEXT, chat_id TEXT, chat_type TEXT, thread_id TEXT, started_at REAL, ended_at REAL, last_activity_at REAL)"
+    )
+    con.executemany(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("vk", "2000000042", "thread", "lane:old", 10.0, 20.0, 30.0),
+            ("vk", "2000000042", "thread", "lane:new", 10.0, 20.0, 99.0),
+            ("vk", "2000009999", "thread", "lane:old", 10.0, 20.0, 1000.0),
+            ("telegram", "2000000042", "thread", "lane:old", 10.0, 20.0, 1000.0),
+        ],
+    )
+    con.commit()
+    con.close()
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+
+    visible, page, total_pages = adapter._project_list_items("2000000042", page=0, page_size=8)
+
+    assert page == 0
+    assert total_pages == 1
+    assert [lane["id"] for lane in visible] == ["new", "old", "never"]
+
+
+def test_project_list_pinned_lanes_stay_above_session_recency(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    db = tmp_path / "state.db"
+    with sqlite3.connect(db) as con:
+        con.execute(
+            "CREATE TABLE sessions (source TEXT, chat_id TEXT, chat_type TEXT, thread_id TEXT, started_at REAL, ended_at REAL, last_activity_at REAL)"
+        )
+        con.execute("INSERT INTO sessions VALUES ('vk', '2000000042', 'thread', 'lane:new', 1, 1, 200)")
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {"id": "pinned", "name": "Pinned"},
+                            {"id": "new", "name": "New"},
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    adapter._lane_state.setdefault("pinned", {})["2000000042"] = ["pinned"]
+
+    visible, _page, _total_pages = adapter._project_list_items("2000000042", page=0, page_size=8)
+
+    assert [lane["id"] for lane in visible] == ["pinned", "new"]
+
+
+def test_project_list_keeps_config_order_when_session_db_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    lanes = [
+        {"id": "first", "name": "First"},
+        {"id": "second", "name": "Second"},
+    ]
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "project_lanes": {"2000000042": {"lanes": lanes}}},
+        )
+    )
+
+    visible, _page, _total_pages = adapter._project_list_items("2000000042", page=0, page_size=8)
+
+    assert [lane["id"] for lane in visible] == ["first", "second"]
+
+@pytest.mark.asyncio
+async def test_project_new_pending_routes_unparseable_text_to_normal_agent_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000042"]},
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 13, "text": "/project new"}}}
+    )
+    adapter.handle_message.assert_not_awaited()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 14, "text": "создай новый проект"}}}
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert "VK project lane creation mode" in event.channel_prompt
+    assert event.text.startswith("создай новый проект")
+
+
+@pytest.mark.asyncio
+async def test_project_new_pending_labeled_text_creates_lane_immediately(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]})
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 15, "text": "/project new"}}}
+    )
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 16,
+                    "text": "Название: Rialo\nНазначение: ретродроп\nПапка: rialo\nСкиллы: coding",
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._get_active_lane_id("2000000042", "100") == "rialo"
+    created = adapter._resolve_lane("2000000042", "rialo")
+    assert created is not None
+    assert created["name"] == "Rialo"
+    assert any(call[0] == "messages.send" and "Проект создан" in call[1].get("message", "") for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_project_new_fast_fallback_creates_and_selects_custom_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]})
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 17, "text": "/project new Rialo coding тестовый проект"}}}
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._get_active_lane_id("2000000042", "100") == "rialo"
+    created = adapter._resolve_lane("2000000042", "rialo")
+    assert created is not None
+    assert created["skills"] == ["coding"]
+
+
+@pytest.mark.asyncio
+async def test_project_edit_fast_fallback_updates_existing_custom_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]})
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 17, "text": "/project new Gito coding старое описание; папка gito"}}}
+    )
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 18,
+                    "text": "/project edit gito папка ai-projects/gito; workdir /home/assistent/ai-projects/gito; контекст: существующий проект Gito",
+                }
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    edited = adapter._resolve_lane("2000000042", "gito")
+    assert edited is not None
+    assert edited["folder"] == "ai-projects/gito"
+    assert edited["workdir"] == "/home/assistent/ai-projects/gito"
+    assert edited["description"] == "существующий проект Gito"
+    assert any("Проект обновлён: Gito" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+@pytest.mark.asyncio
+async def test_project_edit_pending_unparseable_text_routes_to_normal_agent_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "gito", "name": "Gito", "description": "old"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getByConversationMessageId":
+            return {"response": {"items": []}}
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+    await adapter._set_active_lane_id("2000000042", "100", "gito")
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 19, "text": "/project edit"}}}
+    )
+    adapter.handle_message.assert_not_awaited()
+
+    await adapter._handle_update(
+        {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 20, "text": "сделай так, чтобы модель сама поняла нужные изменения"}}}
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert "VK project lane edit mode" in event.channel_prompt
+    assert "Project to edit: gito" in event.channel_prompt
+    assert event.text.startswith("сделай так")
+
+
+@pytest.mark.asyncio
+async def test_project_message_event_select_sets_active_lane_without_agent_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "tccc-ai", "name": "TCCC AI"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_event",
+            "object": {
+                "peer_id": 2000000042,
+                "user_id": 100,
+                "event_id": "evt1",
+                "payload": {"vkpl": "select", "id": "tccc-ai"},
+            },
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    assert adapter._get_active_lane_id("2000000042", "100") == "tccc-ai"
+    assert any(call[0] == "messages.sendMessageEventAnswer" for call in calls)
 
 
 @pytest.mark.asyncio
@@ -469,7 +1538,7 @@ async def test_vk_message_new_with_attachment_builds_media_event():
     )
 
     with patch(
-        "adapter._download_attachment_async",
+        "plugins.platforms.vk.adapter._download_attachment_async",
         AsyncMock(return_value="/tmp/hermes-vk-voice.ogg"),
     ) as download:
         await adapter._handle_update(
@@ -552,7 +1621,7 @@ async def test_vk_forwarded_photo_with_comment_routes_media_url():
     adapter.handle_message = AsyncMock()
     adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
 
-    with patch("adapter._download_attachment_async", AsyncMock(return_value="/tmp/forwarded-photo.jpg")) as download:
+    with patch("plugins.platforms.vk.adapter._download_attachment_async", AsyncMock(return_value="/tmp/forwarded-photo.jpg")) as download:
         await adapter._handle_update(
             {
                 "type": "message_new",
@@ -606,7 +1675,7 @@ async def test_vk_reply_photo_routes_media_url():
     adapter.handle_message = AsyncMock()
     adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
 
-    with patch("adapter._download_attachment_async", AsyncMock(return_value="/tmp/reply-photo.jpg")) as download:
+    with patch("plugins.platforms.vk.adapter._download_attachment_async", AsyncMock(return_value="/tmp/reply-photo.jpg")) as download:
         await adapter._handle_update(
             {
                 "type": "message_new",
@@ -694,7 +1763,7 @@ async def test_vk_materializes_direct_media_urls_for_gateway_processors():
     ]
     media_types = ["image/jpeg", "video/mp4", "audio/mpeg", "application/pdf"]
 
-    with patch("adapter._download_attachment_async", AsyncMock(side_effect=fake_download)) as download:
+    with patch("plugins.platforms.vk.adapter._download_attachment_async", AsyncMock(side_effect=fake_download)) as download:
         result = await adapter._materialize_inbound_media(MessageType.PHOTO, urls, media_types)
 
     assert result == [
@@ -726,8 +1795,8 @@ def test_vk_download_attachment_rejects_content_length_over_limit(monkeypatch, t
         def read(self, _size=-1):
             raise AssertionError("body should not be read when Content-Length exceeds limit")
 
-    monkeypatch.setattr("adapter.get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr("adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("plugins.platforms.vk.adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(RuntimeError, match="too large"):
         _download_attachment("https://vk.example/voice.ogg", "audio/ogg", max_bytes=10)
@@ -754,8 +1823,8 @@ def test_vk_download_attachment_streams_and_stops_after_limit(monkeypatch, tmp_p
         def read(self, _size=-1):
             return self.chunks.pop(0) if self.chunks else b""
 
-    monkeypatch.setattr("adapter.get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr("adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("plugins.platforms.vk.adapter.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
 
     with pytest.raises(RuntimeError, match="exceeded size limit"):
         _download_attachment("https://vk.example/file.pdf", "application/pdf", max_bytes=10)
@@ -894,7 +1963,7 @@ async def test_vk_video_without_native_file_does_not_become_public_watch_url():
 @pytest.mark.asyncio
 async def test_vk_materializer_keeps_regular_video_watch_page_as_url():
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
-    with patch("adapter._download_attachment_async", AsyncMock()) as download:
+    with patch("plugins.platforms.vk.adapter._download_attachment_async", AsyncMock()) as download:
         result = await adapter._materialize_inbound_media(
             MessageType.VIDEO,
             ["https://vk.com/video-1_2?access_key=abc"],
@@ -1042,7 +2111,7 @@ async def test_vk_send_image_file_uploads_and_sends_attachment(tmp_path):
         raise AssertionError(method)
 
     adapter._vk_method = fake_vk_method
-    with patch("adapter._multipart_upload_async", AsyncMock(return_value={"photo": "server-payload"})):
+    with patch("plugins.platforms.vk.adapter._multipart_upload_async", AsyncMock(return_value={"photo": "server-payload"})):
         result = await adapter.send_image_file("2000000001", str(image), caption="caption")
 
     assert result.success is True
@@ -1073,7 +2142,7 @@ async def test_vk_send_video_falls_back_to_document_when_video_save_needs_user_a
         raise AssertionError(method)
 
     adapter._vk_method = fake_vk_method
-    with patch("adapter._multipart_upload_async", AsyncMock(return_value={"file": "server-payload"})) as upload:
+    with patch("plugins.platforms.vk.adapter._multipart_upload_async", AsyncMock(return_value={"file": "server-payload"})) as upload:
         result = await adapter.send_video("2000000001", str(video), caption="caption")
 
     assert result.success is True
@@ -1128,8 +2197,8 @@ async def test_vk_voice_upload_retries_once_on_transient_upload_error(tmp_path):
 
     adapter._vk_method = fake_vk_method
     upload = AsyncMock(side_effect=[RuntimeError('VK upload failed: "unknown error"'), {"file": "server-payload"}])
-    with patch("adapter._multipart_upload_async", upload), \
-         patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+    with patch("plugins.platforms.vk.adapter._multipart_upload_async", upload), \
+         patch("plugins.platforms.vk.adapter.asyncio.sleep", AsyncMock()) as sleep:
         result = await adapter.send_voice("2000000001", str(audio), caption="caption")
 
     assert result.success is True
@@ -1152,8 +2221,8 @@ async def test_vk_voice_upload_does_not_retry_non_retryable_error(tmp_path):
 
     adapter._vk_method = fake_vk_method
     upload = AsyncMock(side_effect=RuntimeError("VK upload returned non-JSON response: '<html>'"))
-    with patch("adapter._multipart_upload_async", upload), \
-         patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+    with patch("plugins.platforms.vk.adapter._multipart_upload_async", upload), \
+         patch("plugins.platforms.vk.adapter.asyncio.sleep", AsyncMock()) as sleep:
         result = await adapter.send_voice("2000000001", str(audio), caption="caption")
 
     assert result.success is False
@@ -1175,7 +2244,7 @@ async def test_vk_send_attachment_retries_once_on_transient_send_error():
         return {"response": 123}
 
     adapter._vk_method = fake_vk_method
-    with patch("adapter.asyncio.sleep", AsyncMock()) as sleep:
+    with patch("plugins.platforms.vk.adapter.asyncio.sleep", AsyncMock()) as sleep:
         result = await adapter._send_attachment("2000000001", "doc-1_2", "caption")
 
     assert result.success is True
@@ -1299,3 +2368,222 @@ async def test_vk_edit_message_rejects_non_editable_zero_id_without_api_call():
     assert result.retryable is False
     assert "editable" in (result.error or "")
     adapter._vk_method.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_vk_send_restores_project_keyboard_for_lane_chat(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "project_lanes": {"2000000042": {"lanes": [{"id": "gito", "name": "Gito"}]}},
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("2000000042", "Stopped.")
+
+    assert result.success is True
+    send_params = [params for method, params in calls if method == "messages.send"][-1]
+    keyboard = json.loads(send_params["keyboard"])
+    labels = [button["action"].get("label") for row in keyboard["buttons"] for button in row]
+    assert keyboard["inline"] is False
+    assert "Проекты" in labels
+    assert "Команды" in labels
+    assert "Меню" not in labels
+
+
+@pytest.mark.asyncio
+async def test_vk_send_remembers_lane_for_thread_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {"2000000042": {"lanes": [{"id": "topic-42", "name": "Health"}]}},
+            },
+        )
+    )
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        assert params is not None
+        assert params["keyboard"]
+        return {"response": [{"conversation_message_id": 77}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("2000000042", "health cron", metadata={"thread_id": "lane:topic-42"})
+
+    assert result.success is True
+    assert adapter._lane_state["message_lanes"]["2000000042:77"] == "topic-42"
+
+
+@pytest.mark.asyncio
+async def test_vk_reply_to_remembered_cron_message_routes_to_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {"id": "topic-42", "name": "Health", "skills": ["my-health"]},
+                            {"id": "search-analytics", "name": "Поиск и аналитика", "skills": ["perplex"]},
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    adapter._lane_state.setdefault("active", {})["2000000042:100"] = "search-analytics"
+    adapter._lane_state.setdefault("message_lanes", {})["2000000042:77"] = "topic-42"
+    adapter.handle_message = AsyncMock()
+    adapter._enrich_message_from_api = AsyncMock(side_effect=lambda msg, **_kwargs: msg)
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 88,
+                    "text": "готово",
+                    "reply_message": {"conversation_message_id": 77, "text": "health cron"},
+                }
+            },
+        }
+    )
+
+    assert adapter.handle_message.await_args is not None
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "lane:topic-42"
+    assert event.source.chat_topic == "Health"
+    assert event.auto_skill == ["my-health"]
+
+
+@pytest.mark.asyncio
+async def test_vk_send_attaches_project_keyboard_for_allowed_chat_without_lanes(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_peers": ["2000000099"]},
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("2000000099", "hello")
+
+    assert result.success is True
+    send_params = [params for method, params in calls if method == "messages.send"][-1]
+    labels = [button["action"].get("label") for row in json.loads(send_params["keyboard"])["buttons"] for button in row]
+    assert labels == ["Проекты", "Новый проект", "Команды"]
+
+
+@pytest.mark.asyncio
+async def test_vk_send_attaches_project_keyboard_for_allowed_dm_without_lanes(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"group_id": "123456789", "allowed_users": ["100"]},
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("100", "hello")
+
+    assert result.success is True
+    send_params = [params for method, params in calls if method == "messages.send"][-1]
+    labels = [button["action"].get("label") for row in json.loads(send_params["keyboard"])["buttons"] for button in row]
+    assert labels == ["Проекты", "Новый проект", "Команды"]
+
+
+@pytest.mark.asyncio
+async def test_vk_send_does_not_attach_project_keyboard_for_unlisted_peer(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send("2000000099", "hello")
+
+    assert result.success is True
+    send_params = [params for method, params in calls if method == "messages.send"][-1]
+    assert "keyboard" not in send_params
+
+
+@pytest.mark.asyncio
+async def test_vk_standalone_send_accepts_platform_config_contract(monkeypatch):
+    calls = []
+
+    async def fake_http_json_async(url, params):
+        calls.append((url, params))
+        return {"response": 321}
+
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", fake_http_json_async)
+    pconfig = PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789"})
+
+    result = await _standalone_send(pconfig, "2000000042", "hello")
+
+    assert result == {"success": True, "message_id": 321}
+    assert calls[0][1]["access_token"] == "test-token"
+    assert calls[0][1]["peer_ids"] == "2000000042"
+    assert calls[0][1]["message"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_vk_standalone_send_keeps_legacy_two_argument_shape(monkeypatch):
+    calls = []
+
+    async def fake_http_json_async(url, params):
+        calls.append((url, params))
+        return {"response": 654}
+
+    monkeypatch.setenv("VK_GROUP_TOKEN", "env-token")
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", fake_http_json_async)
+
+    result = await _standalone_send("2000000042", "legacy")
+
+    assert result == {"success": True, "message_id": 654}
+    assert calls[0][1]["access_token"] == "env-token"
+    assert calls[0][1]["peer_ids"] == "2000000042"
+    assert calls[0][1]["message"] == "legacy"

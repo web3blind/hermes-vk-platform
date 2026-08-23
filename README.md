@@ -20,6 +20,13 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Optional per-channel prompts and skill bindings through Hermes config.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
 
+## Documentation
+
+- [`docs/development.md`](docs/development.md) — plugin structure, runtime flow, testing, and release checks.
+- [`docs/project-lanes.md`](docs/project-lanes.md) — virtual project lanes, pinning, sorting, importer, cron lane routing, and accessibility rules.
+- [`docs/update-guide.md`](docs/update-guide.md) — agent-facing checklist for updating the plugin against a new Hermes version.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common setup and runtime failures.
+
 ## Requirements
 
 - Hermes Agent with plugin support.
@@ -55,7 +62,13 @@ If you prefer manual setup, edit `~/.hermes/.env` as shown below.
 
 1. Create or choose a VK community.
 2. Open community settings and enable community messages.
-3. Enable bot capabilities / allow messages from users.
+3. Enable bot capabilities for conversations:
+   - allow messages from users;
+   - allow adding the community bot to chats/conversations;
+   - enable the option usually named like **chat bot**, **bot can work in conversations**, or **messages in conversations**.
+   - In VK's Russian UI this is often under
+     **Управление сообществом → Сообщения → Настройки для бота → Возможности ботов**:
+     set **Возможности ботов** to enabled and enable **Разрешать добавлять сообщество в чаты**.
 4. Enable Long Poll API for the community.
 5. Enable the `message_new` and `message_edit` event types.
 6. Create a community token with `messages` permission.
@@ -192,6 +205,110 @@ vk:
 
 Secrets such as `group_token` are better stored in `.env`, not config YAML.
 
+### Optional VK project lanes
+
+VK community bots do not have Telegram-style topics or bot-managed Messenger folders. If one physical VK chat should host several Hermes project contexts, configure virtual project lanes as a VK plugin feature:
+
+```yaml
+platforms:
+  vk:
+    extra:
+      project_lanes:
+        enabled: true
+        chats:
+          "2000000001":
+            base_folder: ai-projects
+            default_skills:
+              - coding
+            lanes:
+              - id: rialo
+                name: Rialo
+                description: ретродроп и аналитика проекта Rialo
+                folder: rialo
+                skills:
+                  - blockchain-project-research
+                  - coding
+                aliases:
+                  - rialo
+```
+
+The legacy `vk.project_lanes` shape is still read for backward compatibility, but new automatic writes and imports use `platforms.vk.extra.project_lanes`.
+
+Behavior:
+
+- one VK `peer_id` remains the physical chat container;
+- each lane is routed as a Hermes synthetic thread with `thread_id=lane:<id>`;
+- active lane selection is stored per `peer_id + user_id`;
+- the lane transcript is shared inside the synthetic thread, like Telegram topics / Discord threads;
+- `/new` while a lane is active resets only that lane session;
+- `/project search <query>` searches configured and chat-created lanes;
+- `/project new <name> <skills_csv> <context...>` creates a lane immediately when the id is safe and persists it to the approved VK project-lane config path;
+- `/project new` and `Новый проект` create parseable labeled/free-form lanes immediately, or fall back to a normal Hermes agent turn for ambiguous input;
+- `/project edit <id> <what to change...>` edits an existing lane immediately when the requested field changes can be parsed safely and persists the updated lane;
+- `/project edit` starts the same lightweight guided flow for the active lane: parseable field changes are applied immediately, ambiguous text falls back to a normal Hermes agent turn with edit context;
+- `/project pin` and `/project unpin` pin or unpin the active lane for that VK chat; pinned lanes stay above session-recency sorting;
+- `/invite` returns the current VK chat invite link from the bot using `messages.getInviteLink(peer_id=<current>, reset=0)`;
+- `Команды` / `/commands` shows a screen-reader-friendly text list of VK chat commands with clickable text-command buttons;
+- `/project off` returns that user to the root VK chat context;
+- `VK_HOME_CHANNEL` is not changed by project lanes.
+
+Commands and buttons:
+
+```text
+/project                  show current project/menu
+/project list             show project list
+/project search <query>   search configured and chat-created lanes
+/project off              disable active lane for you in this VK chat
+/project <alias-or-id>    switch active lane
+@alias <text>             send one message to a lane without switching
+/project new              start conversational project creation
+/project new <name> <skills_csv> <context...>
+                          fast fallback creation draft
+/project edit             start editing the active lane
+/project edit <id> <what to change...>
+                          fast fallback edit of an existing lane
+/project pin              pin active project first in this VK chat
+/project unpin            unpin active project
+/invite                   show the current VK chat invite link
+/commands                 show all VK chat commands
+```
+
+Project-list page navigation uses visible `Предыдущая` / `Следующая` text buttons. The hidden payload still carries the exact fallback command such as `/project list 2`; if VK sends only the visible label, the adapter falls back to saved per-user page state and moves relative to the last shown list page. Lists are ordered as pinned lanes first, then lanes with the newest Hermes synthetic-thread session activity, then lanes without activity in stable config/import order.
+
+The `Команды` response includes an inline command keyboard with text buttons for copy-hostile commands such as `/project list`, `/project new`, `/project edit`, `/project off`, and `/invite`. These buttons deliberately use `text` actions so screen readers expose the command label and VK sends the same text a user could type manually.
+
+VK keyboard actions useful for this plugin:
+
+- `text` — sends a visible button label as message text and may also carry payload. This is the preferred accessible/default action for project controls.
+- `callback` — sends a callback event without normal message text. Avoid for core navigation in VK desktop/browser because it can be exposed unreliably or remain stuck as loading.
+- `open_link` — opens a URL, useful for external resources, not for chat commands.
+- platform-specific actions such as location/app/payment are not appropriate for the project-lane command menu.
+
+Example fallback draft command:
+
+```text
+/project new Rialo blockchain-project-research,coding ретродроп и аналитика проекта Rialo
+```
+
+`/project new` without arguments and the `Новый проект` button start a normal Hermes agent-mediated creation flow. The VK adapter only records short-lived pending state and injects a strict project-creation instruction into the next ordinary Hermes turn; it does not directly call a model inside the VK callback path.
+
+Configured/imported lanes live in `platforms.vk.extra.project_lanes`. Runtime UI state such as active lane, pinned lanes, pending create/edit prompts, editable list-message ids, and delivered-message lane anchors remains in `~/.hermes/vk_project_lanes_state.json`. When a user creates or edits a lane from VK and the field changes are deterministic, the adapter writes the lane to the canonical config path automatically, similar to Hermes' topic/thread persistence model, so users do not need to remember a separate export step. If config writing fails, the adapter keeps a state overlay as a fail-safe and logs a warning.
+
+Cron jobs can target a VK project lane with the explicit target form `vk:<peer_id>:lane:<lane_id>` or by using `deliver=origin` when the job origin is a VK synthetic thread. Cron-delivered VK messages are remembered by message id, so replying to the cron message routes into that lane even if the user's currently active project in the same physical VK chat is different.
+
+To import existing mappings into a VK chat:
+
+```bash
+python plugins/platforms/vk/setup_helper.py lanes import --to-peer 2000000001 --from legacy,telegram,discord --telegram-chat-id -1001234567890 --dry-run
+python plugins/platforms/vk/setup_helper.py lanes import --to-peer 2000000001 --from legacy,telegram,discord --telegram-chat-id -1001234567890
+```
+
+The importer reads Telegram topics from `platforms.telegram.extra.group_topics` and `dm_topics` (optionally filtered by `--telegram-chat-id`), legacy VK lanes from `vk.project_lanes`, and Discord thread mapping sections when present. It writes `platforms.vk.extra.project_lanes.enabled: true` and upserts lanes under `chats.<peer>.lanes`.
+
+For authorized VK chats and DMs, normal adapter replies also attach the persistent command keyboard. This keeps `Проекты / Новый проект / Команды` visible even before the first project exists and after ordinary gateway messages such as `/stop` responses.
+
+Project lists are sorted by latest Hermes thread-session activity for that VK peer. The most recently used project appears first; lanes without sessions stay below in config order.
+
 ## Usage
 
 Start or restart the Hermes gateway after configuration:
@@ -211,6 +328,32 @@ If `VK_HOME_CHANNEL` is set, cron jobs and messaging deliveries can target VK by
 ```dotenv
 VK_HOME_CHANNEL=2000000001
 ```
+
+`VK_HOME_CHANNEL` is only the default peer for home/cron/notification delivery.
+It is not the per-chat conversation context, and it should not be moved when a
+new thematic VK chat is created unless the operator explicitly says to make that
+new peer the default Home channel.
+
+When creating a new thematic chat such as "content", "style", or "research":
+
+1. Create or choose the new VK conversation.
+2. Add its peer id to `VK_ALLOWED_PEERS` or the relevant peer allowlist.
+3. Add any matching `vk.channel_prompts` / `vk.channel_skill_bindings` for that
+   peer if a special context is needed.
+4. Restart the gateway.
+5. Send a test message in the new chat.
+
+Do **not** rewrite `VK_HOME_CHANNEL` as part of that flow unless the user asks to
+move Home/default delivery. Keep the existing Home peer stable.
+
+If an agent is asked to "create a content chat", it should confirm whether the
+request means:
+
+- create/configure a separate allowed VK peer for content work; or
+- move the default Home channel to that peer.
+
+The safe default is the first option: create/configure a separate chat and leave
+Home unchanged.
 
 ## Troubleshooting
 
@@ -251,6 +394,46 @@ If VK chat id is `42`, use:
 VK_ALLOWED_PEERS=2000000042
 ```
 
+### `VK API error 912: This is a chat bot feature`
+
+This usually means the VK community exists and the bot may even be present in
+the chat, but the community is not yet allowed to work as a chat bot in group
+conversations.
+
+Open the VK community settings and enable the conversation bot settings. VK's UI
+labels vary, but look for options like:
+
+- **Messages** / community messages;
+- **Bot capabilities** / **Chat bot**;
+- **Bot can work in conversations**;
+- **Allow adding the community to chats/conversations**;
+- **Long Poll API** with `message_new` enabled.
+
+In VK's Russian UI, the exact path is commonly:
+
+```text
+Управление сообществом
+→ Сообщения
+→ Настройки для бота
+→ Возможности ботов
+```
+
+There enable:
+
+- **Возможности ботов**;
+- **Разрешать добавлять сообщество в чаты**.
+
+If you are using Hermes with browser access to a logged-in VK admin account,
+Hermes can help navigate this UI and turn the setting on after you explicitly
+approve that account action. The plugin installer itself does not silently
+change VK community settings.
+
+After changing VK settings, restart Hermes and test the peer again:
+
+```bash
+hermes gateway restart
+```
+
 ### Tool progress creates multiple messages or does not update
 
 This plugin implements `edit_message()` via VK `messages.edit`. If progress editing fails, check that VK returned an editable `conversation_message_id` for sent messages and inspect gateway logs for VK API errors.
@@ -277,3 +460,6 @@ See [`docs/development.md`](docs/development.md).
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+
+VK project lanes accessibility note: `/project list` must include project names and `/project <id>` fallback as plain text, not only VK keyboard buttons. Project selection buttons use VK `text` actions with visible labels, not callback-only actions; some VK desktop/browser clients hide or poorly expose callback/inline keyboards from the accessible tree.

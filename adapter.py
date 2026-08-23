@@ -18,6 +18,7 @@ import mimetypes
 import os
 import random
 import re
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +61,440 @@ def _split_csv(value: Any) -> set[str]:
     else:
         items = str(value).split(",")
     return {str(item).strip() for item in items if str(item).strip()}
+
+
+LANE_THREAD_PREFIX = "lane:"
+PROJECT_LANE_STATE_FILENAME = "vk_project_lanes_state.json"
+PROJECT_CREATE_TTL_SECONDS = 15 * 60
+_SAFE_LANE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _sanitize_lane_label(value: Any, max_len: int = 64) -> str:
+    text = _CONTROL_CHARS_RE.sub(" ", str(value or "").replace("\r", " ").replace("\n", " "))
+    text = " ".join(text.split()).strip()
+    if max_len and len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _slugify_lane_id(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    # Keep ASCII slugs deterministic and path/session-key safe. Cyrillic names
+    # without explicit folder/id become empty and require clarification.
+    text = re.sub(r"[^a-z0-9_-]+", "-", text)
+    text = re.sub(r"[-_]{2,}", "-", text).strip("-_")
+    return text[:64]
+
+
+def _is_safe_lane_id(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or ".." in text or ":" in text or "/" in text or "\\" in text:
+        return False
+    return bool(_SAFE_LANE_ID_RE.fullmatch(text))
+
+
+def _normalize_lane_skills(value: Any) -> list[str]:
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    result: list[str] = []
+    for item in items:
+        skill = str(item or "").strip()
+        if skill and skill not in result:
+            result.append(skill)
+    return result
+
+
+def _normalize_project_lanes(raw: Any) -> dict[str, Any]:
+    """Return normalized VK project-lane config, ignoring unsafe entries.
+
+    Shape: {peer_id: {base_folder, default_skills, lanes, lane_by_id, alias_to_id}}.
+    The function is pure and deliberately permissive: bad entries are skipped so
+    a typo in optional project-lane config cannot disable the VK gateway.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for peer, peer_cfg in raw.items():
+        peer_id = str(peer or "").strip()
+        if not peer_id or not isinstance(peer_cfg, dict):
+            continue
+        lanes_raw = peer_cfg.get("lanes") or []
+        if not isinstance(lanes_raw, list):
+            continue
+        lanes: list[dict[str, Any]] = []
+        lane_by_id: dict[str, dict[str, Any]] = {}
+        alias_to_id: dict[str, str] = {}
+        for lane_raw in lanes_raw:
+            if not isinstance(lane_raw, dict):
+                continue
+            lane_id = str(lane_raw.get("id") or "").strip().lower()
+            if not _is_safe_lane_id(lane_id) or lane_id in lane_by_id:
+                continue
+            name = _sanitize_lane_label(lane_raw.get("name") or lane_id, 80) or lane_id
+            aliases: list[str] = []
+            for alias in lane_raw.get("aliases") or []:
+                alias_text = str(alias or "").strip().lower()
+                if not alias_text or alias_text in alias_to_id or alias_text in lane_by_id:
+                    continue
+                aliases.append(alias_text)
+                alias_to_id[alias_text] = lane_id
+            lane = {
+                "id": lane_id,
+                "name": name,
+                "description": str(lane_raw.get("description") or lane_raw.get("context") or "").strip(),
+                "folder": str(lane_raw.get("folder") or "").strip(),
+                "workdir": str(lane_raw.get("workdir") or "").strip(),
+                "skills": _normalize_lane_skills(lane_raw.get("skills") or lane_raw.get("skill")),
+                "aliases": aliases,
+            }
+            lanes.append(lane)
+            lane_by_id[lane_id] = lane
+        if lanes:
+            normalized[peer_id] = {
+                "base_folder": str(peer_cfg.get("base_folder") or "").strip(),
+                "default_skills": _normalize_lane_skills(peer_cfg.get("default_skills") or peer_cfg.get("default_skill")),
+                "lanes": lanes,
+                "lane_by_id": lane_by_id,
+                "alias_to_id": alias_to_id,
+            }
+    return normalized
+
+
+def _extract_project_lanes_config(raw: Any) -> Any:
+    """Return the actual per-peer lane mapping from supported config shapes.
+
+    Supported shapes:
+    - legacy/direct: {"2000000001": {"lanes": [...]}}
+    - canonical feature: {"enabled": true, "chats": {"2000000001": {"lanes": [...]}}}
+    """
+    if not isinstance(raw, dict):
+        return raw
+    chats = raw.get("chats")
+    if isinstance(chats, dict):
+        if "enabled" in raw and not _truthy(raw.get("enabled")):
+            return {}
+        return chats
+    return raw
+
+
+def _lane_for_config(lane: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "id": str(lane.get("id") or "").strip(),
+        "name": str(lane.get("name") or "").strip(),
+    }
+    for key in ("description", "folder", "workdir", "plan"):
+        value = str(lane.get(key) or "").strip()
+        if value:
+            result[key] = value
+    skills = _normalize_lane_skills(lane.get("skills"))
+    if skills:
+        result["skills"] = skills
+    aliases = [str(a).strip().lstrip("@").lower() for a in lane.get("aliases") or [] if str(a).strip()]
+    if aliases:
+        result["aliases"] = aliases
+    return result
+
+
+def _upsert_lane_in_config(config: dict[str, Any], peer_id: str, lane: dict[str, Any]) -> dict[str, Any]:
+    """Return *config* with a VK project lane persisted under canonical plugin config.
+
+    This mirrors Telegram topic persistence: chat-created routing metadata is
+    promoted into the Hermes config automatically instead of relying on a later
+    manual export step. Legacy ``vk.project_lanes`` remains readable but new
+    writes go to ``platforms.vk.extra.project_lanes``.
+    """
+    peer = str(peer_id or "").strip()
+    if not peer:
+        return config
+    normalized = _normalize_project_lanes({peer: {"lanes": [lane]}}).get(peer)
+    if not normalized or not normalized.get("lanes"):
+        return config
+    lane_entry = _lane_for_config(normalized["lanes"][0])
+    platforms = config.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        platforms = {}
+        config["platforms"] = platforms
+    vk_cfg = platforms.setdefault("vk", {})
+    if not isinstance(vk_cfg, dict):
+        vk_cfg = {}
+        platforms["vk"] = vk_cfg
+    extra = vk_cfg.setdefault("extra", {})
+    if not isinstance(extra, dict):
+        extra = {}
+        vk_cfg["extra"] = extra
+    feature = extra.setdefault("project_lanes", {})
+    if not isinstance(feature, dict):
+        feature = {}
+        extra["project_lanes"] = feature
+    feature["enabled"] = True
+    chats = feature.setdefault("chats", {})
+    if not isinstance(chats, dict):
+        chats = {}
+        feature["chats"] = chats
+    chat_cfg = chats.setdefault(peer, {})
+    if not isinstance(chat_cfg, dict):
+        chat_cfg = {}
+        chats[peer] = chat_cfg
+    lanes = chat_cfg.setdefault("lanes", [])
+    if not isinstance(lanes, list):
+        lanes = []
+        chat_cfg["lanes"] = lanes
+    replaced = False
+    for idx, item in enumerate(lanes):
+        if isinstance(item, dict) and str(item.get("id") or "").strip().lower() == lane_entry["id"]:
+            lanes[idx] = lane_entry
+            replaced = True
+            break
+    if not replaced:
+        lanes.append(lane_entry)
+    return config
+
+
+def _build_project_lane_prompt(peer_id: str) -> str:
+    return (
+        "[VK project lane creation mode]\n"
+        f"The user is creating a VK project lane for peer {peer_id}.\n"
+        "Extract: name, context/description, folder/id, skills.\n"
+        "Validate slug and skills. If anything is missing or ambiguous, ask one concise clarification.\n"
+        "When the adapter can parse fields deterministically it will persist the lane through the approved VK project-lane config path."
+    )
+
+
+def _build_project_lane_edit_prompt(peer_id: str, lane: dict[str, Any]) -> str:
+    return (
+        "[VK project lane edit mode]\n"
+        f"The user is editing a VK project lane for peer {peer_id}.\n"
+        f"Project to edit: {lane.get('id')} ({lane.get('name')}).\n"
+        "Use the user's requested change to update this lane's metadata only: name, context/description, folder, workdir, plan, skills, aliases.\n"
+        "When field changes are deterministic, the adapter persists them through the approved VK project-lane config path."
+    )
+
+
+def _lane_state_path() -> Path:
+    return get_hermes_home() / PROJECT_LANE_STATE_FILENAME
+
+
+def _session_state_db_path() -> Path:
+    return get_hermes_home() / "state.db"
+
+
+def _parse_vk_target_ref(target_ref: str) -> tuple[str, Optional[str]] | None:
+    raw = str(target_ref or "").strip()
+    if not raw:
+        return None
+    if ":" in raw:
+        chat_id, thread_id = raw.split(":", 1)
+        chat_id = chat_id.strip()
+        thread_id = thread_id.strip()
+        if chat_id and thread_id.startswith(LANE_THREAD_PREFIX):
+            lane_id = thread_id[len(LANE_THREAD_PREFIX) :]
+            if _is_safe_lane_id(lane_id):
+                return chat_id, thread_id
+            return None
+    if raw.isdigit() or raw.startswith("200000"):
+        return raw, None
+    return None
+
+
+def _load_lane_state(path: Path) -> dict[str, Any]:
+    empty = {"active": {}, "pending_create": {}, "pending_edit": {}, "custom_lanes": {}, "project_list_messages": {}, "project_list_pages": {}, "message_lanes": {}, "pinned": {}}
+    try:
+        if not path.exists():
+            return dict(empty)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(empty)
+        active = data.get("active") if isinstance(data.get("active"), dict) else {}
+        pending = data.get("pending_create") if isinstance(data.get("pending_create"), dict) else {}
+        pending_edit = data.get("pending_edit") if isinstance(data.get("pending_edit"), dict) else {}
+        custom = data.get("custom_lanes") if isinstance(data.get("custom_lanes"), dict) else {}
+        project_list_messages = data.get("project_list_messages") if isinstance(data.get("project_list_messages"), dict) else {}
+        project_list_pages = data.get("project_list_pages") if isinstance(data.get("project_list_pages"), dict) else {}
+        message_lanes = data.get("message_lanes") if isinstance(data.get("message_lanes"), dict) else {}
+        pinned = data.get("pinned") if isinstance(data.get("pinned"), dict) else {}
+        return {
+            "active": dict(active),
+            "pending_create": dict(pending),
+            "pending_edit": dict(pending_edit),
+            "custom_lanes": dict(custom),
+            "project_list_messages": dict(project_list_messages),
+            "project_list_pages": dict(project_list_pages),
+            "message_lanes": dict(message_lanes),
+            "pinned": dict(pinned),
+        }
+    except Exception as exc:
+        logger.warning("VK: project lane state is unreadable; starting with empty state — %s", _redact_token(str(exc)))
+        return dict(empty)
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _project_create_prompt_text() -> str:
+    return (
+        "Новый проект. Опишите проект: название, назначение/контекст, папку/id и скиллы.\n\n"
+        "Можно свободной фразой:\n"
+        "Создай проект Rialo для ретродропа и аналитики. Папка rialo. "
+        "Скиллы blockchain-project-research, coding.\n\n"
+        "Или строго по полям:\n"
+        "Название: Rialo\n"
+        "Назначение: ретродроп и аналитика проекта Rialo\n"
+        "Папка: rialo\n"
+        "Скиллы: blockchain-project-research, coding"
+    )
+
+
+def _project_edit_prompt_text(lane: dict[str, Any]) -> str:
+    return (
+        f"Редактирование проекта: {lane.get('name') or lane.get('id')}.\n"
+        "Напишите, что изменить: название, контекст/описание, папку, workdir, plan, скиллы или aliases.\n\n"
+        "Пример:\n"
+        "папка ai-projects/gito; workdir /home/assistent/ai-projects/gito; контекст: существующий проект Gito\n\n"
+        "Или одной командой:\n"
+        f"/project edit {lane.get('id')} папка ai-projects/gito; workdir /home/assistent/ai-projects/gito"
+    )
+
+
+def _extract_inline_value(text: str, labels: tuple[str, ...]) -> str:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    next_labels = (
+        r"папка|folder|workdir|рабочая папка|план-файл|plan(?: file)?|контекст|context|"
+        r"описание|description|скиллы|skills|навыки"
+    )
+    match = re.search(
+        rf"(?:^|[;,.\n])\s*(?:{label_pattern})\s*:?\s*([^;\n]+?)(?=\s*(?:[;,.]\s*(?:{next_labels})\b|\n\s*(?:{next_labels})\b)|$)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(match.group(1).strip().split()) if match else ""
+
+
+def _parse_project_new_fallback(args: str) -> dict[str, Any] | None:
+    parts = str(args or "").strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return None
+    name, skills_raw, context = parts
+    skills = _normalize_lane_skills(skills_raw)
+    slug = _slugify_lane_id(name)
+    if not name.strip() or not skills or not context.strip() or not _is_safe_lane_id(slug):
+        return None
+    folder = _extract_inline_value(context, ("папка", "folder")) or slug
+    workdir = _extract_inline_value(context, ("workdir", "рабочая папка"))
+    plan_file = _extract_inline_value(context, ("план-файл проекта", "план-файл", "plan file", "plan"))
+    lane = {"id": slug, "name": name.strip(), "description": context.strip(), "folder": folder, "skills": skills}
+    if workdir:
+        lane["workdir"] = workdir
+    if plan_file:
+        lane["plan"] = plan_file
+    return lane
+
+
+def _parse_project_edit_text(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    updates: dict[str, Any] = {}
+    name = _extract_inline_value(raw, ("название", "имя", "name")) or _extract_labeled_value(raw, ("Название", "Имя", "Name"))
+    folder = _extract_inline_value(raw, ("папка", "folder")) or _extract_labeled_value(raw, ("Папка", "Folder", "ID", "Id", "id"))
+    workdir = _extract_inline_value(raw, ("workdir", "рабочая папка")) or _extract_labeled_value(raw, ("Workdir", "Рабочая папка"))
+    plan_file = _extract_inline_value(raw, ("план-файл проекта", "план-файл", "plan file", "plan")) or _extract_labeled_value(raw, ("План", "Plan", "Plan file"))
+    context = _extract_inline_value(raw, ("контекст", "описание", "context", "description")) or _extract_labeled_value(raw, ("Назначение", "Контекст", "Описание", "Context", "Description"))
+    skills_raw = _extract_inline_value(raw, ("скиллы", "skills", "навыки")) or _extract_labeled_value(raw, ("Скиллы", "Навыки", "Skills"))
+    aliases_raw = _extract_inline_value(raw, ("aliases", "alias", "алиасы", "псевдонимы")) or _extract_labeled_value(raw, ("Aliases", "Алиасы", "Псевдонимы"))
+    if name:
+        updates["name"] = _sanitize_lane_label(name, 80)
+    if folder:
+        updates["folder"] = folder
+    if workdir:
+        updates["workdir"] = workdir
+    if plan_file:
+        updates["plan"] = plan_file
+    if context:
+        updates["description"] = context
+    if skills_raw:
+        skills = _normalize_lane_skills(skills_raw.replace(" и ", ","))
+        if skills:
+            updates["skills"] = skills
+    if aliases_raw:
+        aliases = [item.strip().lstrip("@") for item in re.split(r"[,\s]+", aliases_raw) if item.strip().lstrip("@")]
+        if aliases:
+            updates["aliases"] = aliases
+    return updates or None
+
+
+def _extract_labeled_value(text: str, labels: tuple[str, ...]) -> str:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    next_labels = (
+        "Название|Имя|Name|Проект|Project|Назначение|Контекст|Описание|Context|Description|"
+        "Папка|Folder|ID|Id|id|Скиллы|Навыки|Skills"
+    )
+    match = re.search(
+        rf"(?:^|\n)\s*(?:{label_pattern})\s*:\s*(.*?)(?=\n\s*(?:{next_labels})\s*:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return " ".join(match.group(1).strip().split()) if match else ""
+
+
+def _parse_project_create_text(text: str) -> dict[str, Any] | None:
+    """Parse labeled or simple free-form project creation text deterministically.
+
+    This is a local convenience path. If it cannot parse safely, the adapter
+    routes the message to a normal Hermes turn with the project-creation prompt.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    name = _extract_labeled_value(raw, ("Название", "Имя", "Name", "Проект", "Project"))
+    context = _extract_labeled_value(raw, ("Назначение", "Контекст", "Описание", "Context", "Description"))
+    folder = _extract_labeled_value(raw, ("Папка", "Folder", "ID", "Id", "id"))
+    skills_raw = _extract_labeled_value(raw, ("Скиллы", "Навыки", "Skills"))
+
+    if not any((name, context, folder, skills_raw)):
+        # Simple Russian/English free-form fallback, intentionally conservative.
+        name_match = re.search(r"(?:проект|project)\s+([A-Za-z0-9_-]{2,64})", raw, flags=re.IGNORECASE)
+        folder_match = re.search(r"(?:папка|folder|id)\s+([A-Za-z0-9_-]{2,64})", raw, flags=re.IGNORECASE)
+        skills_match = re.search(r"(?:скиллы|skills|навыки)\s+([^\.\n]+)", raw, flags=re.IGNORECASE)
+        if name_match:
+            name = name_match.group(1)
+        if folder_match:
+            folder = folder_match.group(1)
+        if skills_match:
+            skills_raw = skills_match.group(1)
+        context = raw
+
+    skills = _normalize_lane_skills(skills_raw.replace(" и ", ",")) if skills_raw else []
+    slug = _slugify_lane_id(folder or name)
+    if not name or not context or not skills or not _is_safe_lane_id(slug):
+        return None
+    return {
+        "id": slug,
+        "name": _sanitize_lane_label(name, 80),
+        "description": context,
+        "folder": slug,
+        "workdir": "",
+        "skills": skills,
+        "aliases": [slug] if slug.lower() != name.lower() else [],
+    }
+
+
+def _format_lane_yaml_snippet(lane: dict[str, Any]) -> str:
+    lines = [
+        f"        - id: {lane['id']}",
+        f"          name: {lane['name']}",
+        f"          description: {lane['description']}",
+        f"          folder: {lane.get('folder') or lane['id']}",
+        "          skills:",
+    ]
+    for skill in lane.get("skills") or []:
+        lines.append(f"            - {skill}")
+    return "\n".join(lines)
 
 
 def _parse_positive_int(value: Any, default: int) -> int:
@@ -105,6 +540,24 @@ def _redact_token(text: str) -> str:
     return text
 
 
+def _vk_api_error_message(code: Any, msg: Any) -> str:
+    """Return a redacted, operator-actionable VK API error message."""
+    base = f"VK API error {code}: {msg}"
+    if str(code) == "912":
+        base += (
+            "\n\nHint: VK says this is a chat-bot-only feature. "
+            "For community bots in group conversations, open the VK community "
+            "settings and enable bot capabilities for conversations: community "
+            "messages, bot/Long Poll message events, and the setting that allows "
+            "the community bot to work in chats / be added to conversations. "
+            "In the Russian VK UI this is usually: Управление сообществом → "
+            "Сообщения → Настройки для бота → Возможности ботов. Enable "
+            "'Возможности ботов' and 'Разрешать добавлять сообщество в чаты'. "
+            "After changing VK settings, restart the Hermes gateway and test the peer again."
+        )
+    return _redact_token(base)
+
+
 def _http_json(url: str, params: Optional[dict[str, Any]] = None, *, timeout: int = 35) -> dict[str, Any]:
     """Perform a blocking GET/POST-like request and return decoded JSON.
 
@@ -128,7 +581,7 @@ def _http_json(url: str, params: Optional[dict[str, Any]] = None, *, timeout: in
         err = payload["error"]
         msg = err.get("error_msg") if isinstance(err, dict) else str(err)
         code = err.get("error_code") if isinstance(err, dict) else "unknown"
-        raise RuntimeError(_redact_token(f"VK API error {code}: {msg}"))
+        raise RuntimeError(_vk_api_error_message(code, msg))
     return payload
 
 
@@ -421,6 +874,19 @@ class VKAdapter(BasePlatformAdapter):
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
         self._seen_message_keys: dict[str, float] = {}
         self._seen_edit_keys: dict[str, float] = {}
+        try:
+            raw_project_lanes = extra.get("project_lanes")
+            raw_platforms = extra.get("platforms") if isinstance(extra.get("platforms"), dict) else None
+            if raw_project_lanes is None:
+                vk_extra = (((raw_platforms or {}).get("vk") or {}).get("extra") or {})
+                if isinstance(vk_extra, dict):
+                    raw_project_lanes = vk_extra.get("project_lanes")
+            self.project_lanes = _normalize_project_lanes(_extract_project_lanes_config(raw_project_lanes))
+        except Exception as exc:
+            logger.warning("VK: invalid project_lanes config ignored — %s", _redact_token(str(exc)))
+            self.project_lanes = {}
+        self._lane_state_path = _lane_state_path()
+        self._lane_state = _load_lane_state(self._lane_state_path)
 
     @property
     def name(self) -> str:
@@ -494,6 +960,851 @@ class VKAdapter(BasePlatformAdapter):
         merged.setdefault("v", self.api_version)
         return await _http_json_async(f"{VK_API_BASE}/{method}", merged)
 
+    def _state_key(self, peer_id: str, user_id: str) -> str:
+        return f"{peer_id}:{user_id}"
+
+    def _message_lane_key(self, peer_id: str, message_id: Any) -> str:
+        return f"{peer_id}:{message_id}"
+
+    def _lane_from_thread_id(self, peer_id: str, thread_id: Any) -> dict[str, Any] | None:
+        raw = str(thread_id or "").strip()
+        if not raw.startswith(LANE_THREAD_PREFIX):
+            return None
+        return self._resolve_lane(peer_id, raw[len(LANE_THREAD_PREFIX) :])
+
+    async def _remember_message_lane(self, peer_id: str, message_id: Any, thread_id: Any) -> None:
+        lane = self._lane_from_thread_id(peer_id, thread_id)
+        if not lane or not message_id:
+            return
+        try:
+            session_store = getattr(self, "_session_store", None)
+            if session_store is not None:
+                from gateway.config import Platform
+                from gateway.session import SessionSource
+
+                session_store.get_or_create_session(
+                    SessionSource(
+                        platform=Platform("vk"),
+                        chat_id=str(peer_id),
+                        chat_type="thread",
+                        user_id="system:cron",
+                        user_name="Cron",
+                        thread_id=f"{LANE_THREAD_PREFIX}{lane['id']}",
+                        chat_topic=lane.get("name"),
+                    )
+                )
+        except Exception as exc:
+            logger.debug("VK: failed to pre-create lane session for delivered message — %s", _redact_token(str(exc)))
+        messages = self._lane_state.setdefault("message_lanes", {})
+        if not isinstance(messages, dict):
+            messages = {}
+            self._lane_state["message_lanes"] = messages
+        key = self._message_lane_key(str(peer_id), str(message_id).removeprefix("cmid:"))
+        messages[key] = lane["id"]
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist message lane mapping — %s", _redact_token(str(exc)))
+
+    def _reply_lane(self, peer_id: str, msg: dict[str, Any]) -> dict[str, Any] | None:
+        reply = msg.get("reply_message") if isinstance(msg.get("reply_message"), dict) else None
+        if not reply:
+            return None
+        reply_id = reply.get("conversation_message_id") or reply.get("id")
+        if reply_id is None:
+            return None
+        messages_obj = self._lane_state.get("message_lanes")
+        messages = messages_obj if isinstance(messages_obj, dict) else {}
+        lane_id = messages.get(self._message_lane_key(str(peer_id), str(reply_id)))
+        return self._resolve_lane(peer_id, str(lane_id or "")) if lane_id else None
+
+    def _peer_lanes(self, peer_id: str) -> dict[str, Any] | None:
+        peer = str(peer_id)
+        base = self.project_lanes.get(peer) if isinstance(self.project_lanes, dict) else None
+        cfg: dict[str, Any] = {
+            "base_folder": "",
+            "default_skills": [],
+            "lanes": [],
+            "lane_by_id": {},
+            "alias_to_id": {},
+        }
+        if isinstance(base, dict):
+            cfg["base_folder"] = base.get("base_folder") or ""
+            cfg["default_skills"] = list(base.get("default_skills") or [])
+            for lane in base.get("lanes") or []:
+                if isinstance(lane, dict) and lane.get("id") not in cfg["lane_by_id"]:
+                    cfg["lanes"].append(lane)
+                    cfg["lane_by_id"][lane["id"]] = lane
+            cfg["alias_to_id"].update(base.get("alias_to_id") or {})
+        custom_raw = (self._lane_state.get("custom_lanes") or {}).get(peer) or []
+        custom_cfg = _normalize_project_lanes({peer: {"lanes": custom_raw}}).get(peer) or {}
+        for lane in custom_cfg.get("lanes") or []:
+            if lane.get("id") in cfg["lane_by_id"]:
+                for idx, existing in enumerate(cfg["lanes"]):
+                    if existing.get("id") == lane.get("id"):
+                        cfg["lanes"][idx] = lane
+                        break
+                cfg["lane_by_id"][lane["id"]] = lane
+                continue
+            cfg["lanes"].append(lane)
+            cfg["lane_by_id"][lane["id"]] = lane
+        cfg["alias_to_id"].update(custom_cfg.get("alias_to_id") or {})
+        return cfg if cfg["lanes"] else None
+
+    def _should_attach_project_keyboard(self, chat_id: str) -> bool:
+        """Return True when the VK peer/DM should receive the persistent helper keyboard.
+
+        The keyboard is an accessibility affordance, not evidence that a peer
+        already has lanes.  Authorized chats and DMs should expose `Проекты`,
+        `Новый проект`, and `Команды` so users do not need to memorize slash
+        commands before the first project exists.
+        """
+        peer = str(chat_id or "").strip()
+        if not peer:
+            return False
+        if self.allow_all_users:
+            return True
+        if peer in self.allowed_peers:
+            return True
+        if peer in self.allowed_users:
+            return True
+        if self.home_channel and peer == self.home_channel:
+            return True
+        if isinstance(self.project_lanes, dict) and peer in self.project_lanes:
+            return True
+        return False
+
+    def _lane_last_activity(self, peer_id: str, lane_ids: list[str]) -> dict[str, float]:
+        """Return latest Hermes session activity per VK project lane.
+
+        Project lanes are synthetic Hermes threads (`thread_id = lane:<id>`), so
+        the canonical recency source is the shared session database.  Fail open:
+        if the DB is unavailable or migrated, keep config order instead of
+        breaking `/project list`.
+        """
+        safe_ids = [str(lane_id or "").strip() for lane_id in lane_ids if str(lane_id or "").strip()]
+        if not safe_ids:
+            return {}
+        db_path = _session_state_db_path()
+        if not db_path.exists():
+            return {}
+        placeholders = ",".join("?" for _ in safe_ids)
+        thread_ids = [f"{LANE_THREAD_PREFIX}{lane_id}" for lane_id in safe_ids]
+        try:
+            uri = db_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as con:
+                rows = con.execute(
+                    f"""
+                    SELECT thread_id, MAX(COALESCE(last_activity_at, ended_at, started_at, 0)) AS activity
+                    FROM sessions
+                    WHERE source = 'vk'
+                      AND chat_id = ?
+                      AND chat_type = 'thread'
+                      AND thread_id IN ({placeholders})
+                    GROUP BY thread_id
+                    """,
+                    [str(peer_id), *thread_ids],
+                ).fetchall()
+        except Exception as exc:
+            logger.debug("VK: could not read lane session recency; keeping config order — %s", _redact_token(str(exc)))
+            return {}
+        result: dict[str, float] = {}
+        for thread_id, activity in rows:
+            lane_id = str(thread_id or "")
+            if lane_id.startswith(LANE_THREAD_PREFIX):
+                lane_id = lane_id[len(LANE_THREAD_PREFIX) :]
+            try:
+                result[lane_id] = float(activity or 0)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _sort_lanes_by_session_recency(self, peer_id: str, lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        activity = self._lane_last_activity(peer_id, [str(lane.get("id") or "") for lane in lanes if isinstance(lane, dict)])
+        pinned_obj = self._lane_state.get("pinned")
+        pinned_for_peer = (pinned_obj if isinstance(pinned_obj, dict) else {}).get(str(peer_id))
+        pinned_ids = {str(item) for item in pinned_for_peer} if isinstance(pinned_for_peer, list) else set()
+        if not activity and not pinned_ids:
+            return lanes
+        ordered = sorted(
+            enumerate(lanes),
+            key=lambda pair: (
+                str(pair[1].get("id") or "") in pinned_ids,
+                activity.get(str(pair[1].get("id") or ""), 0.0),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        return [lane for _idx, lane in ordered]
+
+    def _is_pinned_lane(self, peer_id: str, lane_id: str) -> bool:
+        pinned_obj = self._lane_state.get("pinned")
+        pinned_for_peer = (pinned_obj if isinstance(pinned_obj, dict) else {}).get(str(peer_id))
+        return str(lane_id) in {str(item) for item in pinned_for_peer} if isinstance(pinned_for_peer, list) else False
+
+    async def _set_pinned_lane(self, peer_id: str, lane_id: str, pinned: bool) -> bool:
+        lane = self._resolve_lane(peer_id, lane_id)
+        if not lane:
+            return False
+        pinned_root = self._lane_state.setdefault("pinned", {})
+        if not isinstance(pinned_root, dict):
+            pinned_root = {}
+            self._lane_state["pinned"] = pinned_root
+        current = [str(item) for item in pinned_root.get(str(peer_id), [])] if isinstance(pinned_root.get(str(peer_id)), list) else []
+        if pinned and lane["id"] not in current:
+            current.insert(0, lane["id"])
+        elif not pinned:
+            current = [item for item in current if item != lane["id"]]
+        pinned_root[str(peer_id)] = current
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist pinned project state — %s", _redact_token(str(exc)))
+        return True
+
+    def _resolve_lane(self, peer_id: str, token: str) -> dict[str, Any] | None:
+        cfg = self._peer_lanes(peer_id)
+        if not cfg:
+            return None
+        lookup = str(token or "").strip().lower()
+        lane_id = (cfg.get("alias_to_id") or {}).get(lookup) or lookup
+        lane = (cfg.get("lane_by_id") or {}).get(lane_id)
+        if isinstance(lane, dict):
+            return lane
+        for candidate in cfg.get("lanes") or []:
+            if isinstance(candidate, dict) and str(candidate.get("name") or "").strip().lower() == lookup:
+                return candidate
+        return None
+
+    def _get_active_lane_id(self, peer_id: str, user_id: str) -> str | None:
+        key = self._state_key(peer_id, user_id)
+        lane_id = str((self._lane_state.get("active") or {}).get(key) or "").strip()
+        if lane_id and self._resolve_lane(peer_id, lane_id):
+            return lane_id
+        return None
+
+    async def _persist_lane_state(self) -> None:
+        data = self._lane_state
+        path = self._lane_state_path
+        await asyncio.to_thread(_atomic_write_json, path, data)
+
+    async def _persist_lane_config(self, peer_id: str, lane: dict[str, Any]) -> bool:
+        def write() -> bool:
+            from hermes_cli.config import load_config, save_config
+
+            cfg = load_config()
+            if not isinstance(cfg, dict):
+                cfg = {}
+            _upsert_lane_in_config(cfg, str(peer_id), lane)
+            save_config(
+                cfg,
+                preserve_keys={
+                    ("platforms", "vk", "extra", "project_lanes"),
+                    ("platforms", "vk", "extra", "project_lanes", "chats", str(peer_id)),
+                },
+            )
+            return True
+
+        try:
+            await asyncio.to_thread(write)
+            cfg = self.project_lanes.setdefault(str(peer_id), {"base_folder": "", "default_skills": [], "lanes": [], "lane_by_id": {}, "alias_to_id": {}})
+            normalized = _normalize_project_lanes({str(peer_id): {"lanes": [lane]}}).get(str(peer_id))
+            if normalized and normalized.get("lanes"):
+                new_lane = normalized["lanes"][0]
+                lanes = cfg.setdefault("lanes", [])
+                replaced = False
+                for idx, item in enumerate(lanes):
+                    if isinstance(item, dict) and item.get("id") == new_lane["id"]:
+                        lanes[idx] = new_lane
+                        replaced = True
+                        break
+                if not replaced:
+                    lanes.append(new_lane)
+                cfg.setdefault("lane_by_id", {})[new_lane["id"]] = new_lane
+                cfg.setdefault("alias_to_id", {})
+                for alias in new_lane.get("aliases") or []:
+                    cfg["alias_to_id"][alias] = new_lane["id"]
+            return True
+        except Exception as exc:
+            logger.warning("VK: failed to persist project lane config — %s", _redact_token(str(exc)))
+            return False
+
+    async def _add_custom_lane(self, peer_id: str, lane: dict[str, Any]) -> bool:
+        normalized = _normalize_project_lanes({str(peer_id): {"lanes": [lane]}}).get(str(peer_id))
+        if not normalized or not normalized.get("lanes"):
+            return False
+        lane = normalized["lanes"][0]
+        persisted = await self._persist_lane_config(peer_id, lane)
+        if not persisted:
+            custom = self._lane_state.setdefault("custom_lanes", {})
+            lanes = custom.setdefault(str(peer_id), [])
+            if not isinstance(lanes, list):
+                lanes = []
+                custom[str(peer_id)] = lanes
+            replaced = False
+            for idx, item in enumerate(lanes):
+                if isinstance(item, dict) and str(item.get("id") or "") == lane["id"]:
+                    lanes[idx] = lane
+                    replaced = True
+                    break
+            if not replaced:
+                lanes.append(lane)
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist custom project lane — %s", _redact_token(str(exc)))
+        return True
+
+    async def _update_custom_lane(self, peer_id: str, lane_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        existing = self._resolve_lane(peer_id, lane_id)
+        if not existing or not updates:
+            return None
+        merged = dict(existing)
+        merged.update(updates)
+        merged["id"] = str(existing.get("id") or lane_id)
+        normalized = _normalize_project_lanes({str(peer_id): {"lanes": [merged]}}).get(str(peer_id))
+        if not normalized or not normalized.get("lanes"):
+            return None
+        lane = normalized["lanes"][0]
+        custom = self._lane_state.setdefault("custom_lanes", {})
+        lanes = custom.setdefault(str(peer_id), [])
+        if not isinstance(lanes, list):
+            lanes = []
+            custom[str(peer_id)] = lanes
+        replaced = False
+        for idx, item in enumerate(lanes):
+            if isinstance(item, dict) and str(item.get("id") or "") == lane["id"]:
+                lanes[idx] = lane
+                replaced = True
+                break
+        if not replaced:
+            lanes.append(lane)
+        await self._persist_lane_config(peer_id, lane)
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist edited project lane — %s", _redact_token(str(exc)))
+        return lane
+
+    async def _set_active_lane_id(self, peer_id: str, user_id: str, lane_id: str | None) -> bool:
+        if lane_id and not self._resolve_lane(peer_id, lane_id):
+            return False
+        active = self._lane_state.setdefault("active", {})
+        key = self._state_key(peer_id, user_id)
+        if lane_id:
+            active[key] = str(lane_id)
+        else:
+            active.pop(key, None)
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist project lane state — %s", _redact_token(str(exc)))
+        return True
+
+    def _pending_create(self, peer_id: str, user_id: str) -> dict[str, Any] | None:
+        pending = self._lane_state.get("pending_create") or {}
+        item = pending.get(self._state_key(peer_id, user_id))
+        if not isinstance(item, dict):
+            return None
+        if float(item.get("expires_at") or 0) < time.time():
+            pending.pop(self._state_key(peer_id, user_id), None)
+            return None
+        return item
+
+    async def _set_pending_create(self, peer_id: str, user_id: str) -> None:
+        pending = self._lane_state.setdefault("pending_create", {})
+        pending[self._state_key(peer_id, user_id)] = {"expires_at": time.time() + PROJECT_CREATE_TTL_SECONDS}
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist project create state — %s", _redact_token(str(exc)))
+
+    async def _clear_pending_create(self, peer_id: str, user_id: str) -> None:
+        pending = self._lane_state.setdefault("pending_create", {})
+        pending.pop(self._state_key(peer_id, user_id), None)
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist project create state — %s", _redact_token(str(exc)))
+
+    def _pending_edit(self, peer_id: str, user_id: str) -> dict[str, Any] | None:
+        pending = self._lane_state.get("pending_edit") or {}
+        item = pending.get(self._state_key(peer_id, user_id))
+        if not isinstance(item, dict):
+            return None
+        if float(item.get("expires_at") or 0) < time.time():
+            pending.pop(self._state_key(peer_id, user_id), None)
+            return None
+        lane_id = str(item.get("lane_id") or "")
+        if not lane_id or not self._resolve_lane(peer_id, lane_id):
+            pending.pop(self._state_key(peer_id, user_id), None)
+            return None
+        return item
+
+    async def _set_pending_edit(self, peer_id: str, user_id: str, lane_id: str) -> None:
+        pending = self._lane_state.setdefault("pending_edit", {})
+        pending[self._state_key(peer_id, user_id)] = {"lane_id": lane_id, "expires_at": time.time() + PROJECT_CREATE_TTL_SECONDS}
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist project edit state — %s", _redact_token(str(exc)))
+
+    async def _clear_pending_edit(self, peer_id: str, user_id: str) -> None:
+        pending = self._lane_state.setdefault("pending_edit", {})
+        pending.pop(self._state_key(peer_id, user_id), None)
+        try:
+            await self._persist_lane_state()
+        except Exception as exc:
+            logger.warning("VK: failed to persist project edit state — %s", _redact_token(str(exc)))
+
+    def _project_keyboard(self) -> str:
+        buttons = [
+            [{"action": {"type": "text", "label": "Проекты", "payload": json.dumps({"vkpl": "list"}, ensure_ascii=False)}, "color": "secondary"}],
+            [{"action": {"type": "text", "label": "Новый проект", "payload": json.dumps({"vkpl": "new"}, ensure_ascii=False)}, "color": "primary"}],
+            [{"action": {"type": "text", "label": "Команды", "payload": json.dumps({"vkpl": "commands"}, ensure_ascii=False)}, "color": "secondary"}],
+        ]
+        return json.dumps({"one_time": False, "inline": False, "buttons": buttons}, ensure_ascii=False)
+
+    def _project_cancel_keyboard(self) -> str:
+        payload = json.dumps({"vkpl": "cancel"}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "one_time": False,
+                "inline": True,
+                "buttons": [[{"action": {"type": "callback", "label": "Отмена", "payload": payload}}]],
+            },
+            ensure_ascii=False,
+        )
+
+    def _project_selected_keyboard(self, peer_id: str, lane_id: str) -> str:
+        is_pinned = self._is_pinned_lane(peer_id, lane_id)
+        action = "unpin" if is_pinned else "pin"
+        label = "Открепить проект" if is_pinned else "Закрепить проект"
+        payload = json.dumps({"vkpl": action, "id": lane_id}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "one_time": False,
+                "inline": True,
+                "buttons": [[{"action": {"type": "text", "label": label, "payload": payload}}]],
+            },
+            ensure_ascii=False,
+        )
+
+    def _project_list_items(self, peer_id: str, page: int = 0, page_size: int = 8) -> tuple[list[dict[str, Any]], int, int]:
+        cfg = self._peer_lanes(peer_id) or {}
+        lanes = self._sort_lanes_by_session_recency(str(peer_id), list(cfg.get("lanes") or []))
+        total_pages = max(1, (len(lanes) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        return lanes[page * page_size : (page + 1) * page_size], page, total_pages
+
+    def _project_list_text(self, peer_id: str, page: int = 0, page_size: int = 8) -> str:
+        cfg = self._peer_lanes(peer_id) or {}
+        lanes = self._sort_lanes_by_session_recency(str(peer_id), list(cfg.get("lanes") or []))
+        if not lanes:
+            return "Проекты пока не созданы. Используй кнопку Новый проект или /project new."
+        visible, page, total_pages = self._project_list_items(peer_id, page=page, page_size=page_size)
+        lines = ["Выберите проект:"]
+        for lane in lanes:
+            name = _sanitize_lane_label(lane.get("name"), 80)
+            lane_id = str(lane.get("id") or "")
+            aliases = ", ".join("@" + str(alias) for alias in (lane.get("aliases") or [])[:4])
+            suffix = f"; aliases: {aliases}" if aliases else ""
+            lines.append(f"- {name}: /project {lane_id}{suffix}")
+        if len(lanes) > len(visible):
+            lines.append(f"Кнопками показаны первые {len(visible)} проектов; остальные доступны текстовой командой из списка.")
+        else:
+            lines.append("Если кнопки видны, можно нажать кнопку проекта; если нет — используй строку выше.")
+        return "\n".join(lines)
+
+    def _project_commands_text(self) -> str:
+        return "\n".join(
+            [
+                "Команды VK-чата:",
+                "/project — текущий проект и меню",
+                "/project list — список проектов",
+                "/project list N — открыть страницу N списка проектов",
+                "/project search <query> — найти проект",
+                "/project <id-or-alias> — выбрать проект",
+                "@alias <text> — разовое сообщение в проект без переключения",
+                "/project new — создать проект пошагово",
+                "/project new <name> <skills_csv> <context> — создать проект одной командой",
+                "/project edit — изменить текущий проект пошагово",
+                "/project edit <id> <что изменить> — изменить проект одной командой",
+                "/project pin — закрепить текущий проект первым в списке",
+                "/project unpin — открепить текущий проект",
+                "/project off — выйти из проектного режима",
+                "/invite — актуальный инвайт в текущий VK-чат",
+                "Кнопки ниже кликабельные: нажми команду, и VK отправит её в чат.",
+            ]
+        )
+
+    def _project_commands_keyboard(self) -> str:
+        rows = [
+            [
+                {"action": {"type": "text", "label": "/project", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project"}, ensure_ascii=False)}},
+                {"action": {"type": "text", "label": "/project list", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project list"}, ensure_ascii=False)}},
+            ],
+            [
+                {"action": {"type": "text", "label": "/project new", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project new"}, ensure_ascii=False)}},
+                {"action": {"type": "text", "label": "/project edit", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project edit"}, ensure_ascii=False)}},
+            ],
+            [
+                {"action": {"type": "text", "label": "/project pin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project pin"}, ensure_ascii=False)}},
+                {"action": {"type": "text", "label": "/project unpin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project unpin"}, ensure_ascii=False)}},
+            ],
+            [
+                {"action": {"type": "text", "label": "/project off", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project off"}, ensure_ascii=False)}},
+                {"action": {"type": "text", "label": "/invite", "payload": json.dumps({"vkpl": "cmd", "cmd": "/invite"}, ensure_ascii=False)}},
+            ],
+        ]
+        return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
+
+    def _strip_bot_mention_prefix(self, text: str) -> str:
+        raw = str(text or "").strip()
+        group_id = str(self.group_id or "").strip()
+        if group_id:
+            raw = re.sub(rf"^@club{re.escape(group_id)}\b\s*", "", raw, flags=re.IGNORECASE).strip()
+            raw = re.sub(rf"^\[club{re.escape(group_id)}\|[^\]]+\]\s*", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^@club\d+\b\s+", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"^\[club\d+\|[^\]]+\]\s*", "", raw, flags=re.IGNORECASE).strip()
+        return raw
+
+    def _project_list_keyboard(self, peer_id: str, page: int = 0, page_size: int = 8) -> str:
+        visible, page, total_pages = self._project_list_items(peer_id, page=page, page_size=page_size)
+        rows: list[list[dict[str, Any]]] = []
+        row: list[dict[str, Any]] = []
+        for lane in visible:
+            payload = json.dumps({"vkpl": "select", "id": lane["id"]}, ensure_ascii=False)
+            row.append({"action": {"type": "text", "label": _sanitize_lane_label(lane.get("name"), 40), "payload": payload}})
+            if len(row) == 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        nav: list[dict[str, Any]] = []
+        if page > 0:
+            nav.append(
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "Предыдущая",
+                        "payload": json.dumps({"vkpl": "page", "p": page - 1, "cmd": f"/project list {page}"}, ensure_ascii=False),
+                    }
+                }
+            )
+        if page + 1 < total_pages:
+            nav.append(
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "Следующая",
+                        "payload": json.dumps({"vkpl": "page", "p": page + 1, "cmd": f"/project list {page + 2}"}, ensure_ascii=False),
+                    }
+                }
+            )
+        if nav:
+            rows.append(nav)
+        return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
+
+    async def _send_project_text(self, peer_id: str, text: str, *, keyboard: str | None = None) -> str | None:
+        try:
+            params = {"peer_ids": str(peer_id), "message": self.format_message(text), "random_id": random.randint(1, 2_147_483_647)}
+            if keyboard:
+                params["keyboard"] = keyboard
+            payload = await self._vk_method("messages.send", params)
+            return self._sent_message_id(payload)
+        except Exception as exc:
+            logger.warning("VK: failed to send project-lane control message — %s", _redact_token(str(exc)))
+            return None
+
+    async def _edit_project_text(self, peer_id: str, message_id: str, text: str, *, keyboard: str | None = None) -> bool:
+        if not message_id or message_id in {"0", "__no_edit__"}:
+            return False
+        try:
+            params = {"peer_id": str(peer_id), "message": self.format_message(text)}
+            if str(message_id).startswith("cmid:"):
+                params["conversation_message_id"] = str(message_id).split(":", 1)[1]
+            else:
+                params["message_id"] = str(message_id)
+            if keyboard:
+                params["keyboard"] = keyboard
+            await self._vk_method("messages.edit", params)
+            return True
+        except Exception as exc:
+            logger.debug("VK: failed to edit project-lane control message — %s", _redact_token(str(exc)))
+            return False
+
+    async def _send_or_edit_project_list(self, peer_id: str, user_id: str, page: int = 0, *, prefer_edit: bool = False) -> None:
+        _visible, page, _total_pages = self._project_list_items(peer_id, page)
+        text = self._project_list_text(peer_id, page)
+        keyboard = self._project_list_keyboard(peer_id, page)
+        state_key = self._state_key(peer_id, user_id)
+        messages = self._lane_state.setdefault("project_list_messages", {})
+        pages = self._lane_state.setdefault("project_list_pages", {})
+        message_id = str(messages.get(state_key) or "") if isinstance(messages, dict) else ""
+        edited = False
+        if prefer_edit and message_id:
+            edited = await self._edit_project_text(peer_id, message_id, text, keyboard=keyboard)
+        if not edited:
+            sent_id = await self._send_project_text(peer_id, text, keyboard=keyboard)
+            if sent_id and isinstance(messages, dict):
+                messages[state_key] = sent_id
+        if edited or (isinstance(messages, dict) and messages.get(state_key)):
+            if isinstance(pages, dict):
+                pages[state_key] = page
+            try:
+                await self._persist_lane_state()
+            except Exception as exc:
+                logger.debug("VK: failed to persist project-list state — %s", _redact_token(str(exc)))
+
+    async def _answer_message_event(self, event_id: str, user_id: str, peer_id: str, text: str) -> None:
+        if not event_id:
+            return
+        try:
+            await self._vk_method(
+                "messages.sendMessageEventAnswer",
+                {
+                    "event_id": str(event_id),
+                    "user_id": str(user_id),
+                    "peer_id": str(peer_id),
+                    "event_data": json.dumps({"type": "show_snackbar", "text": text[:90]}, ensure_ascii=False),
+                },
+            )
+        except Exception as exc:
+            logger.debug("VK: message_event answer failed — %s", _redact_token(str(exc)))
+
+    async def _handle_message_event_update(self, update: dict[str, Any]) -> None:
+        obj = update.get("object") or {}
+        if not isinstance(obj, dict):
+            return
+        peer_id = str(obj.get("peer_id") or "")
+        user_id = str(obj.get("user_id") or obj.get("from_id") or "")
+        if not self._is_authorized(from_id=user_id, peer_id=peer_id):
+            logger.info("VK: ignoring unauthorized callback sender=%s peer=%s", user_id, peer_id)
+            return
+        raw_payload = obj.get("payload") or {}
+        if isinstance(raw_payload, str):
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                payload = {}
+        else:
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
+        if payload.get("vkpl") is None:
+            return
+        action = str(payload.get("vkpl") or "")
+        if action == "select":
+            lane = self._resolve_lane(peer_id, str(payload.get("id") or ""))
+            if not lane:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект не найден")
+                return
+            await self._set_active_lane_id(peer_id, user_id, lane["id"])
+            await self._send_project_text(
+                peer_id,
+                f"Проект выбран: {lane['name']}\n\nГде остановились:\n— пока нет истории\n\nПиши задачу. /new начнёт новую сессию внутри этого проекта.",
+                keyboard=self._project_keyboard(),
+            )
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект выбран")
+            return
+        if action == "page":
+            page = int(payload.get("p") or 0)
+            await self._send_or_edit_project_list(peer_id, user_id, page, prefer_edit=True)
+            return
+        if action == "commands":
+            await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Команды")
+            return
+        if action == "cmd":
+            command = str(payload.get("cmd") or "").strip()
+            if command == "/invite":
+                await self._handle_invite_command(peer_id, command)
+            elif command:
+                await self._handle_project_command(peer_id, user_id, command)
+            return
+        if action == "new":
+            await self._set_pending_create(peer_id, user_id)
+            await self._send_project_text(peer_id, _project_create_prompt_text(), keyboard=self._project_cancel_keyboard())
+            return
+        if action == "cancel":
+            await self._clear_pending_create(peer_id, user_id)
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Отменено")
+            return
+        await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Неизвестное действие")
+
+    async def _handle_project_command(self, peer_id: str, user_id: str, text: str) -> bool:
+        lowered = text.strip()
+        if lowered in {"Проекты", "Меню", "Новый проект", "Команды"}:
+            if lowered == "Проекты":
+                await self._send_or_edit_project_list(peer_id, user_id)
+            elif lowered == "Новый проект":
+                await self._set_pending_create(peer_id, user_id)
+                await self._send_project_text(peer_id, _project_create_prompt_text(), keyboard=self._project_cancel_keyboard())
+            elif lowered == "Команды":
+                await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
+            else:
+                lane_id = self._get_active_lane_id(peer_id, user_id)
+                lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
+                current = lane.get("name") if lane else "не выбран"
+                await self._send_project_text(peer_id, f"Меню проектов VK\nТекущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._project_keyboard())
+            return True
+        if not lowered.startswith("/project"):
+            if lowered.lower() in {"/commands", "/command", "команды"}:
+                await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
+                return True
+            if lowered in {"Следующая", "Предыдущая"}:
+                pages = self._lane_state.setdefault("project_list_pages", {})
+                state_key = self._state_key(peer_id, user_id)
+                current_page = 0
+                if isinstance(pages, dict):
+                    try:
+                        current_page = int(pages.get(state_key) or 0)
+                    except (TypeError, ValueError):
+                        current_page = 0
+                delta = 1 if lowered == "Следующая" else -1
+                await self._send_or_edit_project_list(peer_id, user_id, current_page + delta, prefer_edit=True)
+                return True
+            return False
+        args = lowered[len("/project"):].strip()
+        if not args:
+            lane_id = self._get_active_lane_id(peer_id, user_id)
+            lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
+            current = lane.get("name") if lane else "не выбран"
+            await self._send_project_text(peer_id, f"Текущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._project_keyboard())
+            return True
+        if args == "list" or re.fullmatch(r"list\s+\d+", args):
+            page = 0
+            match = re.fullmatch(r"list\s+(\d+)", args)
+            if match:
+                page = max(0, int(match.group(1)) - 1)
+            await self._send_or_edit_project_list(peer_id, user_id, page, prefer_edit=bool(match))
+            return True
+        if args.startswith("search "):
+            query = args[len("search "):].strip().lower()
+            cfg = self._peer_lanes(peer_id) or {}
+            matches = []
+            for lane in cfg.get("lanes") or []:
+                haystack = " ".join(
+                    str(part or "") for part in (lane.get("id"), lane.get("name"), lane.get("description"), " ".join(lane.get("aliases") or []))
+                ).lower()
+                if query and query in haystack:
+                    matches.append(f"- {lane.get('name')} (`{lane.get('id')}`)")
+            await self._send_project_text(peer_id, "Найденные проекты:\n" + ("\n".join(matches) if matches else "ничего не найдено"), keyboard=self._project_keyboard())
+            return True
+        if args == "off":
+            await self._set_active_lane_id(peer_id, user_id, None)
+            await self._send_project_text(peer_id, "Проектный режим отключён для тебя в этом чате.", keyboard=self._project_keyboard())
+            return True
+        if args in {"pin", "unpin"}:
+            lane_id = self._get_active_lane_id(peer_id, user_id)
+            lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
+            if not lane:
+                await self._send_project_text(peer_id, "Сначала выбери проект, потом /project pin или /project unpin.", keyboard=self._project_list_keyboard(peer_id))
+                return True
+            pinned = args == "pin"
+            await self._set_pinned_lane(peer_id, lane["id"], pinned)
+            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._project_keyboard())
+            return True
+        if args.startswith("pin ") or args.startswith("unpin "):
+            command, _, target = args.partition(" ")
+            lane = self._resolve_lane(peer_id, target.strip())
+            if not lane:
+                await self._send_project_text(peer_id, "Проект не найден. Открой список: /project list", keyboard=self._project_list_keyboard(peer_id))
+                return True
+            pinned = command == "pin"
+            await self._set_pinned_lane(peer_id, lane["id"], pinned)
+            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._project_keyboard())
+            return True
+        if args == "new":
+            await self._set_pending_create(peer_id, user_id)
+            await self._send_project_text(peer_id, _project_create_prompt_text(), keyboard=self._project_cancel_keyboard())
+            return True
+        if args.startswith("new "):
+            lane = _parse_project_new_fallback(args[4:])
+            if not lane:
+                await self._send_project_text(peer_id, "Формат: /project new <name> <skills_csv> <context...>")
+                return True
+            if not await self._add_custom_lane(peer_id, lane):
+                await self._send_project_text(peer_id, "Не удалось создать проект: id уже занят или данные не прошли проверку.")
+                return True
+            await self._set_active_lane_id(peer_id, user_id, lane["id"])
+            await self._send_project_text(
+                peer_id,
+                "Проект создан и выбран: " + lane["name"] + "\n\n```yaml\n" + _format_lane_yaml_snippet(lane) + "\n```",
+                keyboard=self._project_keyboard(),
+            )
+            return True
+        if args == "edit":
+            lane_id = self._get_active_lane_id(peer_id, user_id)
+            lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
+            if not lane:
+                await self._send_project_text(peer_id, "Сначала выбери проект или укажи его явно: /project edit <id> <что изменить>", keyboard=self._project_list_keyboard(peer_id))
+                return True
+            await self._set_pending_edit(peer_id, user_id, lane["id"])
+            await self._send_project_text(peer_id, _project_edit_prompt_text(lane), keyboard=self._project_cancel_keyboard())
+            return True
+        if args.startswith("edit "):
+            target_and_rest = args[5:].strip()
+            target, sep, edit_text = target_and_rest.partition(" ")
+            lane = self._resolve_lane(peer_id, target)
+            if not lane:
+                await self._send_project_text(peer_id, "Проект для редактирования не найден. Формат: /project edit <id> <что изменить>", keyboard=self._project_list_keyboard(peer_id))
+                return True
+            if not sep or not edit_text.strip():
+                await self._set_pending_edit(peer_id, user_id, lane["id"])
+                await self._send_project_text(peer_id, _project_edit_prompt_text(lane), keyboard=self._project_cancel_keyboard())
+                return True
+            updates = _parse_project_edit_text(edit_text)
+            if not updates:
+                await self._set_pending_edit(peer_id, user_id, lane["id"])
+                await self._send_project_text(peer_id, "Не смогла надёжно разобрать изменения. Напиши их следующим сообщением свободно или по полям.", keyboard=self._project_cancel_keyboard())
+                return True
+            edited = await self._update_custom_lane(peer_id, lane["id"], updates)
+            if not edited:
+                await self._send_project_text(peer_id, "Не удалось обновить проект: данные не прошли проверку.", keyboard=self._project_keyboard())
+                return True
+            await self._set_active_lane_id(peer_id, user_id, edited["id"])
+            await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"] + "\n\n```yaml\n" + _format_lane_yaml_snippet(edited) + "\n```", keyboard=self._project_keyboard())
+            return True
+        lane = self._resolve_lane(peer_id, args)
+        if not lane:
+            await self._send_project_text(peer_id, "Проект не найден. Открой список: /project list", keyboard=self._project_list_keyboard(peer_id))
+            return True
+        await self._set_active_lane_id(peer_id, user_id, lane["id"])
+        await self._send_project_text(peer_id, f"Проект выбран: {lane['name']}\n\nГде остановились:\n— пока нет истории\n\nПиши задачу. /new начнёт новую сессию внутри этого проекта.", keyboard=self._project_selected_keyboard(peer_id, lane["id"]))
+        return True
+
+    async def _handle_invite_command(self, peer_id: str, text: str) -> bool:
+        if text.strip().lower() != "/invite":
+            return False
+        if not str(peer_id).startswith("200000"):
+            await self._send_project_text(peer_id, "Команда /invite работает только в VK-чате, не в личном диалоге.")
+            return True
+        try:
+            payload = await self._vk_method("messages.getInviteLink", {"peer_id": str(peer_id), "reset": 0})
+            response = payload.get("response")
+            link = ""
+            if isinstance(response, dict):
+                link = str(response.get("link") or response.get("invite_link") or "").strip()
+            elif isinstance(response, str):
+                link = response.strip()
+            if not link:
+                raise RuntimeError("VK invite response does not contain link")
+            await self._send_project_text(peer_id, f"Актуальный инвайт в этот VK-чат:\n{link}")
+        except Exception as exc:
+            logger.warning("VK: failed to fetch invite link for peer=%s — %s", peer_id, _redact_token(str(exc)))
+            await self._send_project_text(peer_id, "Не удалось получить инвайт в текущий VK-чат. Проверь права бота в этом чате.")
+        return True
+
+    def _one_shot_lane_for_text(self, peer_id: str, text: str) -> tuple[dict[str, Any] | None, str]:
+        if not text.startswith("@"):
+            return None, text
+        first, _, rest = text.partition(" ")
+        alias = first[1:].strip().lower()
+        lane = self._resolve_lane(peer_id, alias)
+        if not lane:
+            return None, text
+        return lane, rest.strip()
+
     async def _refresh_longpoll_server(self) -> None:
         payload = await self._vk_method("groups.getLongPollServer", {"group_id": self.group_id})
         response = payload.get("response") or {}
@@ -540,6 +1851,12 @@ class VKAdapter(BasePlatformAdapter):
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         update_type = str(update.get("type") or "")
+        if update_type == "message_event":
+            try:
+                await self._handle_message_event_update(update)
+            except Exception as exc:
+                logger.warning("VK: project callback handling failed safely — %s", _redact_token(str(exc)))
+            return
         if update_type not in {"message_new", "message_edit"}:
             return
         obj = update.get("object") or {}
@@ -588,18 +1905,208 @@ class VKAdapter(BasePlatformAdapter):
             text = self._merge_caption(text, forwarded_summary)
         if not text and not media_urls:
             return
+        control_text = self._strip_bot_mention_prefix(text)
+
+        try:
+            raw_button_payload = msg.get("payload") or {}
+            if isinstance(raw_button_payload, str):
+                try:
+                    button_payload = json.loads(raw_button_payload)
+                except json.JSONDecodeError:
+                    button_payload = {}
+            else:
+                button_payload = raw_button_payload if isinstance(raw_button_payload, dict) else {}
+            lane_to_select = None
+            if button_payload.get("vkpl") == "list":
+                await self._send_or_edit_project_list(peer_id, from_id)
+                return
+            if button_payload.get("vkpl") == "menu":
+                await self._handle_project_command(peer_id, from_id, "Меню")
+                return
+            if button_payload.get("vkpl") == "new":
+                await self._set_pending_create(peer_id, from_id)
+                await self._send_project_text(peer_id, _project_create_prompt_text(), keyboard=self._project_cancel_keyboard())
+                return
+            if button_payload.get("vkpl") == "page":
+                page = int(button_payload.get("p") or 0)
+                await self._send_or_edit_project_list(peer_id, from_id, page, prefer_edit=True)
+                return
+            if button_payload.get("vkpl") == "commands":
+                await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
+                return
+            if button_payload.get("vkpl") == "cmd":
+                command = str(button_payload.get("cmd") or "").strip()
+                if command == "/invite":
+                    await self._handle_invite_command(peer_id, command)
+                elif command:
+                    await self._handle_project_command(peer_id, from_id, command)
+                return
+            if button_payload.get("vkpl") == "select":
+                lane_to_select = self._resolve_lane(peer_id, str(button_payload.get("id") or ""))
+            elif button_payload.get("vkpl") in {"pin", "unpin"}:
+                lane = self._resolve_lane(peer_id, str(button_payload.get("id") or ""))
+                if lane:
+                    pinned = button_payload.get("vkpl") == "pin"
+                    await self._set_pinned_lane(peer_id, lane["id"], pinned)
+                    await self._send_project_text(
+                        peer_id,
+                        ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"],
+                        keyboard=self._project_keyboard(),
+                    )
+                    return
+            elif control_text and not control_text.startswith("/") and not media_urls:
+                lane_to_select = self._resolve_lane(peer_id, control_text)
+            if lane_to_select:
+                await self._set_active_lane_id(peer_id, from_id, lane_to_select["id"])
+                await self._send_project_text(
+                    peer_id,
+                    f"Проект выбран: {lane_to_select['name']}\n\nГде остановились:\n— пока нет истории\n\nПиши задачу. /new начнёт новую сессию внутри этого проекта.",
+                    keyboard=self._project_selected_keyboard(peer_id, lane_to_select["id"]),
+                )
+                return
+        except Exception as exc:
+            logger.warning("VK: project button selection failed safely; falling back to normal message — %s", _redact_token(str(exc)))
 
         chat_type = "group" if peer_id.startswith("200000") else "dm"
         chat_name, chat_topic = await self._resolve_conversation_context(peer_id, chat_type=chat_type)
         user_name = f"VK user {from_id}"
 
+        try:
+            pending_create = self._pending_create(peer_id, from_id)
+            if pending_create:
+                parsed_lane = _parse_project_create_text(text)
+                if parsed_lane:
+                    await self._clear_pending_create(peer_id, from_id)
+                    if await self._add_custom_lane(peer_id, parsed_lane):
+                        await self._set_active_lane_id(peer_id, from_id, parsed_lane["id"])
+                        await self._send_project_text(peer_id, "Проект создан и выбран: " + parsed_lane["name"], keyboard=self._project_keyboard())
+                        return
+                    await self._send_project_text(peer_id, "Не удалось создать проект: id уже занят или данные не прошли проверку.", keyboard=self._project_cancel_keyboard())
+                    return
+        except Exception as exc:
+            logger.warning("VK: pending project local creation failed safely — %s", _redact_token(str(exc)))
+
+        try:
+            pending_edit = self._pending_edit(peer_id, from_id)
+            if pending_edit:
+                lane_id = str(pending_edit.get("lane_id") or "")
+                updates = _parse_project_edit_text(text)
+                if updates:
+                    await self._clear_pending_edit(peer_id, from_id)
+                    edited = await self._update_custom_lane(peer_id, lane_id, updates)
+                    if edited:
+                        await self._set_active_lane_id(peer_id, from_id, edited["id"])
+                        await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"], keyboard=self._project_keyboard())
+                        return
+                    await self._send_project_text(peer_id, "Не удалось обновить проект: данные не прошли проверку.", keyboard=self._project_cancel_keyboard())
+                    return
+        except Exception as exc:
+            logger.warning("VK: pending project local edit failed safely — %s", _redact_token(str(exc)))
+
+        try:
+            wants_cancel = text.strip().lower() in {"отмена", "cancel"}
+            if wants_cancel and self._pending_create(peer_id, from_id):
+                await self._clear_pending_create(peer_id, from_id)
+                await self._send_project_text(peer_id, "Создание проекта отменено.", keyboard=self._project_keyboard())
+                return
+            if wants_cancel and self._pending_edit(peer_id, from_id):
+                await self._clear_pending_edit(peer_id, from_id)
+                await self._send_project_text(peer_id, "Редактирование проекта отменено.", keyboard=self._project_keyboard())
+                return
+        except Exception as exc:
+            logger.warning("VK: pending project cancel failed safely — %s", _redact_token(str(exc)))
+
+        try:
+            if await self._handle_invite_command(peer_id, control_text):
+                return
+        except Exception as exc:
+            logger.warning("VK: invite command failed safely; falling back to normal message — %s", _redact_token(str(exc)))
+
+        try:
+            if await self._handle_project_command(peer_id, from_id, control_text):
+                return
+        except Exception as exc:
+            logger.warning("VK: project command failed safely; falling back to normal message — %s", _redact_token(str(exc)))
+
+        pending_create = None
+        pending_edit = None
+        try:
+            pending_create = self._pending_create(peer_id, from_id)
+        except Exception as exc:
+            logger.warning("VK: pending project state failed safely — %s", _redact_token(str(exc)))
+        try:
+            pending_edit = self._pending_edit(peer_id, from_id)
+        except Exception as exc:
+            logger.warning("VK: pending project edit state failed safely — %s", _redact_token(str(exc)))
+
+        selected_lane = None
+        one_shot_lane = None
+        try:
+            reply_lane = self._reply_lane(peer_id, msg)
+            one_shot_lane, stripped_text = self._one_shot_lane_for_text(peer_id, text)
+            if reply_lane:
+                selected_lane = reply_lane
+            elif pending_edit:
+                selected_lane = self._resolve_lane(peer_id, str(pending_edit.get("lane_id") or ""))
+            elif one_shot_lane and stripped_text:
+                selected_lane = one_shot_lane
+                text = stripped_text
+            elif one_shot_lane and media_urls:
+                selected_lane = one_shot_lane
+            else:
+                active_lane_id = self._get_active_lane_id(peer_id, from_id)
+                selected_lane = self._resolve_lane(peer_id, active_lane_id or "") if active_lane_id else None
+        except Exception as exc:
+            logger.warning("VK: project lane routing failed safely; using root chat — %s", _redact_token(str(exc)))
+            selected_lane = None
+
+        event_chat_type = chat_type
+        event_chat_topic = chat_topic
+        event_auto_skill = resolve_channel_skills(self.config.extra, peer_id)
+        event_channel_prompt = resolve_channel_prompt(self.config.extra, peer_id)
+        if selected_lane:
+            event_chat_type = "thread"
+            event_chat_topic = selected_lane.get("name") or event_chat_topic
+            lane_skills = selected_lane.get("skills") or []
+            default_skills = (self._peer_lanes(peer_id) or {}).get("default_skills") or []
+            merged_skills: list[str] = []
+            for skill in [*(event_auto_skill or []), *default_skills, *lane_skills]:
+                if skill and skill not in merged_skills:
+                    merged_skills.append(skill)
+            event_auto_skill = merged_skills or event_auto_skill
+            lane_prompt_parts = []
+            if event_channel_prompt:
+                lane_prompt_parts.append(event_channel_prompt)
+            if selected_lane.get("description"):
+                lane_prompt_parts.append(f"[VK project lane]\nProject: {selected_lane.get('name')}\nContext: {selected_lane.get('description')}")
+            event_channel_prompt = "\n\n".join(lane_prompt_parts) or event_channel_prompt
+
+        if pending_create:
+            try:
+                await self._clear_pending_create(peer_id, from_id)
+            except Exception as exc:
+                logger.warning("VK: failed to clear pending project state — %s", _redact_token(str(exc)))
+            event_channel_prompt = "\n\n".join(
+                part for part in (event_channel_prompt, _build_project_lane_prompt(peer_id)) if part
+            )
+
+        if pending_edit and selected_lane:
+            try:
+                await self._clear_pending_edit(peer_id, from_id)
+            except Exception as exc:
+                logger.warning("VK: failed to clear pending project edit state — %s", _redact_token(str(exc)))
+            event_channel_prompt = "\n\n".join(
+                part for part in (event_channel_prompt, _build_project_lane_edit_prompt(peer_id, selected_lane)) if part
+            )
+
         source = self.build_source(
             chat_id=peer_id,
             chat_name=chat_name,
-            chat_type=chat_type,
+            chat_type=event_chat_type,
             user_id=from_id,
             user_name=user_name,
-            chat_topic=chat_topic,
+            thread_id=f"{LANE_THREAD_PREFIX}{selected_lane['id']}" if selected_lane else None,
+            chat_topic=event_chat_topic,
             message_id=str(conversation_message_id) if conversation_message_id else None,
         )
         event = MessageEvent(
@@ -610,8 +2117,8 @@ class VKAdapter(BasePlatformAdapter):
             message_id=str(conversation_message_id) if conversation_message_id else None,
             media_urls=media_urls,
             media_types=media_types,
-            auto_skill=resolve_channel_skills(self.config.extra, peer_id),
-            channel_prompt=resolve_channel_prompt(self.config.extra, peer_id),
+            auto_skill=event_auto_skill,
+            channel_prompt=event_channel_prompt,
         )
         await self.handle_message(event)
 
@@ -1224,16 +2731,18 @@ class VKAdapter(BasePlatformAdapter):
 
     async def _send_attachment(self, chat_id: str, attachment: str, caption: Optional[str] = None) -> SendResult:
         try:
+            default_keyboard = self._project_keyboard() if self._should_attach_project_keyboard(chat_id) else None
+
             async def op():
-                return await self._vk_method(
-                    "messages.send",
-                    {
-                        "peer_ids": str(chat_id),
-                        "message": caption or "",
-                        "attachment": attachment,
-                        "random_id": random.randint(1, 2_147_483_647),
-                    },
-                )
+                params = {
+                    "peer_ids": str(chat_id),
+                    "message": caption or "",
+                    "attachment": attachment,
+                    "random_id": random.randint(1, 2_147_483_647),
+                }
+                if default_keyboard:
+                    params["keyboard"] = default_keyboard
+                return await self._vk_method("messages.send", params)
 
             payload = await _retry_vk_transient_once("messages.send attachment", op)
             message_id = self._sent_message_id(payload)
@@ -1297,25 +2806,29 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
 
         chunks = self.truncate_message(self.format_message(content or ""), self.max_message_length)
+        default_keyboard = self._project_keyboard() if self._should_attach_project_keyboard(chat_id) else None
         last_message_id: Optional[str] = None
         continuation_ids: list[str] = []
         try:
             for chunk in chunks:
                 async def op(chunk=chunk):
-                    return await self._vk_method(
-                        "messages.send",
-                        {
-                            "peer_ids": str(chat_id),
-                            "message": chunk,
-                            "random_id": random.randint(1, 2_147_483_647),
-                        },
-                    )
+                    params = {
+                        "peer_ids": str(chat_id),
+                        "message": chunk,
+                        "random_id": random.randint(1, 2_147_483_647),
+                    }
+                    if default_keyboard:
+                        params["keyboard"] = default_keyboard
+                    return await self._vk_method("messages.send", params)
 
                 payload = await _retry_vk_transient_once("messages.send", op)
                 message_id = self._sent_message_id(payload)
                 if last_message_id:
                     continuation_ids.append(last_message_id)
                 last_message_id = message_id
+            thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            if thread_id and last_message_id:
+                await self._remember_message_lane(str(chat_id), last_message_id, thread_id)
             return SendResult(success=True, message_id=last_message_id, continuation_message_ids=tuple(continuation_ids))
         except Exception as exc:
             return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
@@ -1486,8 +2999,14 @@ def _env_enablement() -> Optional[dict[str, Any]]:
 
 
 def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[dict[str, Any]]:
-    vk_cfg = ((yaml_cfg or {}).get("gateway") or {}).get("vk") or (yaml_cfg or {}).get("vk") or {}
-    if not isinstance(vk_cfg, dict):
+    root = yaml_cfg or {}
+    platforms_cfg = root.get("platforms") if isinstance(root.get("platforms"), dict) else {}
+    platforms_vk_cfg = platforms_cfg.get("vk") if isinstance(platforms_cfg, dict) and isinstance(platforms_cfg.get("vk"), dict) else {}
+    platforms_vk_extra_obj = platforms_vk_cfg.get("extra") if isinstance(platforms_vk_cfg, dict) else {}
+    platforms_vk_extra = platforms_vk_extra_obj if isinstance(platforms_vk_extra_obj, dict) else {}
+    legacy_vk_cfg = ((root.get("gateway") or {}).get("vk") if isinstance(root.get("gateway"), dict) else None) or root.get("vk") or {}
+    vk_cfg = legacy_vk_cfg if isinstance(legacy_vk_cfg, dict) else {}
+    if not isinstance(vk_cfg, dict) and not isinstance(platforms_vk_cfg, dict):
         return None
     extra: dict[str, Any] = {}
     mapping = {
@@ -1526,6 +3045,11 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
         value = vk_cfg.get(key)
         if value is not None:
             extra[key] = value
+    canonical_project_lanes = platforms_vk_extra.get("project_lanes") if isinstance(platforms_vk_extra, dict) else None
+    if canonical_project_lanes is not None:
+        extra["project_lanes"] = _normalize_project_lanes(_extract_project_lanes_config(canonical_project_lanes))
+    elif "project_lanes" in vk_cfg:
+        extra["project_lanes"] = _normalize_project_lanes(_extract_project_lanes_config(vk_cfg.get("project_lanes")))
     return extra or None
 
 
@@ -1536,20 +3060,51 @@ def _is_connected(config: Any) -> bool:
     return bool(token and group_id)
 
 
-async def _standalone_send(chat_id: str, text: str, **_: Any) -> dict[str, Any]:
-    token = os.getenv("VK_GROUP_TOKEN")
+async def _standalone_send(config_or_chat_id: Any, chat_id: Any = None, text: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Standalone sender used by `hermes send --to vk:...` and cron delivery.
+
+    Hermes' standalone platform contract calls handlers as
+    `(platform_config, chat_id, text, ...)`.  Keep compatibility with the older
+    two-argument `(chat_id, text, ...)` shape so direct callers do not break.
+    """
+    platform_config = None
+    if text is None:
+        # Legacy shape: _standalone_send(chat_id, text, ...)
+        text = "" if chat_id is None else str(chat_id)
+        chat_id = config_or_chat_id
+    else:
+        platform_config = config_or_chat_id
+
+    extra = getattr(platform_config, "extra", {}) or {}
+    token = (
+        os.getenv("VK_GROUP_TOKEN")
+        or getattr(platform_config, "token", None)
+        or extra.get("group_token")
+    )
     if not token:
         return {"success": False, "error": "VK_GROUP_TOKEN is not configured"}
     params = {
         "access_token": token,
         "v": os.getenv("VK_API_VERSION") or VK_API_VERSION,
-        "peer_id": str(chat_id),
+        "peer_ids": str(chat_id),
         "message": text or "",
         "random_id": random.randint(1, 2_147_483_647),
     }
     try:
         payload = await _http_json_async(f"{VK_API_BASE}/messages.send", params)
-        return {"success": True, "message_id": payload.get("response")}
+        response = payload.get("response")
+        message_id = VKAdapter._sent_message_id(payload) if isinstance(response, list) else response
+        thread_id = kwargs.get("thread_id")
+        if thread_id and message_id:
+            state = _load_lane_state(_lane_state_path())
+            if str(thread_id).startswith(LANE_THREAD_PREFIX):
+                lane_id = str(thread_id)[len(LANE_THREAD_PREFIX) :]
+                if _is_safe_lane_id(lane_id):
+                    messages = state.setdefault("message_lanes", {})
+                    if isinstance(messages, dict):
+                        messages[f"{chat_id}:{str(message_id).removeprefix('cmid:')}"] = lane_id
+                        _lane_state_path().write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        return {"success": True, "message_id": message_id}
     except Exception as exc:
         return {"success": False, "error": _redact_token(str(exc))}
 
@@ -1580,6 +3135,7 @@ def register(ctx) -> None:
         allowed_users_env="VK_ALLOWED_USERS",
         allow_all_env="VK_ALLOW_ALL_USERS",
         cron_deliver_env_var="VK_HOME_CHANNEL",
+        parse_target_ref_fn=_parse_vk_target_ref,
         standalone_sender_fn=_standalone_send,
         emoji="🔵",
         platform_hint="You are connected through VK Messenger. Keep replies concise; VK has no Telegram-style topics.",

@@ -661,7 +661,13 @@ async def test_vk_button_text_mentions_are_stripped_before_gateway_message(monke
                 "project_lanes": {
                     "2000000042": {
                         "lanes": [
-                            {"id": "tccc-ai", "name": "TCCC AI", "aliases": ["tccc"], "workdir": "", "skills": []}
+                            {
+                                "id": "hermes-vk-plugin",
+                                "name": "Hermes VK-плагин",
+                                "aliases": ["vk-plugin"],
+                                "workdir": "",
+                                "skills": [],
+                            }
                         ]
                     }
                 },
@@ -670,7 +676,7 @@ async def test_vk_button_text_mentions_are_stripped_before_gateway_message(monke
     )
     adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
     adapter.handle_message = AsyncMock()
-    await adapter._set_active_lane_id("2000000042", "100", "tccc-ai")
+    await adapter._set_active_lane_id("2000000042", "100", "hermes-vk-plugin")
 
     await adapter._handle_update(
         {
@@ -688,7 +694,7 @@ async def test_vk_button_text_mentions_are_stripped_before_gateway_message(monke
 
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "3"
-    assert event.source.thread_id == "lane:tccc-ai"
+    assert event.source.thread_id == "lane:hermes-vk-plugin"
 
 
 @pytest.mark.asyncio

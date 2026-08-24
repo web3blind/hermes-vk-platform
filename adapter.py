@@ -1423,12 +1423,33 @@ class VKAdapter(BasePlatformAdapter):
         )
 
     def _clarify_keyboard(self, clarify_id: str, choices: list[Any]) -> str:
-        buttons: list[tuple[str, dict[str, Any]]] = [
-            (str(idx + 1), {"vkcl": str(idx), "id": clarify_id})
-            for idx in range(len(choices))
-        ]
-        buttons.append(("✏️ Свой ответ", {"vkcl": "other", "id": clarify_id}))
-        return self._inline_callback_keyboard(buttons, row_size=5)
+        rows: list[list[dict[str, Any]]] = []
+        row: list[dict[str, Any]] = []
+        for idx in range(len(choices)):
+            row.append(
+                {
+                    "action": {
+                        "type": "text",
+                        "label": str(idx + 1),
+                        "payload": json.dumps({"vkcl": str(idx), "id": clarify_id}, ensure_ascii=False),
+                    }
+                }
+            )
+            if len(row) >= 5:
+                rows.append(row)
+                row = []
+        row.append(
+            {
+                "action": {
+                    "type": "text",
+                    "label": "✏️ Свой ответ",
+                    "payload": json.dumps({"vkcl": "other", "id": clarify_id}, ensure_ascii=False),
+                }
+            }
+        )
+        if row:
+            rows.append(row)
+        return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
 
     @staticmethod
     def _empty_inline_keyboard() -> str:
@@ -1631,6 +1652,85 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("VK: message_event answer failed — %s", _redact_token(str(exc)))
 
+    async def _handle_clarify_payload(
+        self,
+        *,
+        peer_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+        message_id: Any = None,
+        event_id: str = "",
+    ) -> bool:
+        if payload.get("vkcl") is None:
+            return False
+
+        choice_token = str(payload.get("vkcl") or "")
+        clarify_id = str(payload.get("id") or "")
+        session_key = self._clarify_state.get(clarify_id)
+        if not clarify_id or not session_key:
+            await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже обработан или устарел")
+            return True
+
+        if choice_token == "other":
+            flipped = False
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                flipped = mark_awaiting_text(clarify_id)
+            except Exception as exc:
+                logger.error("VK: clarify Other callback failed — %s", _redact_token(str(exc)), exc_info=True)
+            if not flipped:
+                self._clarify_state.pop(clarify_id, None)
+                await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже устарел")
+                return True
+            label = "✏️ Напиши свой ответ в чат"
+            await self._answer_message_event(event_id, user_id, peer_id, label)
+            if message_id:
+                await self._edit_project_text(peer_id, f"cmid:{message_id}", "✏️ Напиши свой ответ в чат.", keyboard=self._empty_inline_keyboard())
+            return True
+
+        try:
+            idx = int(choice_token)
+        except (TypeError, ValueError):
+            await self._answer_message_event(event_id, user_id, peer_id, "Некорректный вариант")
+            return True
+
+        resolved_text: Optional[str] = None
+        try:
+            from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+
+            entry = _clarify_entries.get(clarify_id)
+            if entry and entry.choices and 0 <= idx < len(entry.choices):
+                resolved_text = str(entry.choices[idx])
+        except Exception:
+            resolved_text = None
+
+        if resolved_text is None:
+            await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже устарел")
+            self._clarify_state.pop(clarify_id, None)
+            return True
+
+        resolved = False
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+        except Exception as exc:
+            logger.error("VK: failed to resolve clarify button — %s", _redact_token(str(exc)), exc_info=True)
+        self._clarify_state.pop(clarify_id, None)
+        if resolved:
+            label = f"✓ {resolved_text[:60]}"
+            try:
+                self.resume_typing_for_chat(str(peer_id))
+            except Exception:
+                pass
+        else:
+            label = "⌛ Вопрос устарел"
+        await self._answer_message_event(event_id, user_id, peer_id, label)
+        if message_id:
+            await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+        return True
+
     async def _handle_message_event_update(self, update: dict[str, Any]) -> None:
         obj = update.get("object") or {}
         if not isinstance(obj, dict):
@@ -1720,73 +1820,13 @@ class VKAdapter(BasePlatformAdapter):
                 logger.error("VK: slash-confirm callback failed — %s", _redact_token(str(exc)), exc_info=True)
             return
 
-        if payload.get("vkcl") is not None:
-            choice_token = str(payload.get("vkcl") or "")
-            clarify_id = str(payload.get("id") or "")
-            session_key = self._clarify_state.get(clarify_id)
-            if not clarify_id or not session_key:
-                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Вопрос уже обработан или устарел")
-                return
-
-            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
-            if choice_token == "other":
-                flipped = False
-                try:
-                    from tools.clarify_gateway import mark_awaiting_text
-
-                    flipped = mark_awaiting_text(clarify_id)
-                except Exception as exc:
-                    logger.error("VK: clarify Other callback failed — %s", _redact_token(str(exc)), exc_info=True)
-                if not flipped:
-                    self._clarify_state.pop(clarify_id, None)
-                    await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Вопрос уже устарел")
-                    return
-                label = "✏️ Напиши свой ответ в чат"
-                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
-                if message_id:
-                    await self._edit_project_text(peer_id, f"cmid:{message_id}", "✏️ Напиши свой ответ в чат.", keyboard=self._empty_inline_keyboard())
-                return
-
-            try:
-                idx = int(choice_token)
-            except (TypeError, ValueError):
-                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректный вариант")
-                return
-
-            resolved_text: Optional[str] = None
-            try:
-                from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-
-                entry = _clarify_entries.get(clarify_id)
-                if entry and entry.choices and 0 <= idx < len(entry.choices):
-                    resolved_text = str(entry.choices[idx])
-            except Exception:
-                resolved_text = None
-
-            if resolved_text is None:
-                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Вопрос уже устарел")
-                self._clarify_state.pop(clarify_id, None)
-                return
-
-            resolved = False
-            try:
-                from tools.clarify_gateway import resolve_gateway_clarify
-
-                resolved = resolve_gateway_clarify(clarify_id, resolved_text)
-            except Exception as exc:
-                logger.error("VK: failed to resolve clarify button — %s", _redact_token(str(exc)), exc_info=True)
-            self._clarify_state.pop(clarify_id, None)
-            if resolved:
-                label = f"✓ {resolved_text[:60]}"
-                try:
-                    self.resume_typing_for_chat(str(peer_id))
-                except Exception:
-                    pass
-            else:
-                label = "⌛ Вопрос устарел"
-            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
-            if message_id:
-                await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+        if await self._handle_clarify_payload(
+            peer_id=peer_id,
+            user_id=user_id,
+            payload=payload,
+            message_id=obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid"),
+            event_id=str(obj.get("event_id") or ""),
+        ):
             return
 
         if payload.get("vkpl") is None:
@@ -2115,6 +2155,13 @@ class VKAdapter(BasePlatformAdapter):
                     button_payload = {}
             else:
                 button_payload = raw_button_payload if isinstance(raw_button_payload, dict) else {}
+            if await self._handle_clarify_payload(
+                peer_id=peer_id,
+                user_id=from_id,
+                payload=button_payload,
+                message_id=conversation_message_id,
+            ):
+                return
             lane_to_select = None
             if button_payload.get("vkpl") == "list":
                 await self._send_or_edit_project_list(peer_id, from_id)

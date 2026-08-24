@@ -1642,6 +1642,8 @@ async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monke
     assert keyboard["inline"] is True
     labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
     assert labels == ["1", "2", "3", "✏️ Свой ответ"]
+    action_types = [button["action"]["type"] for row in keyboard["buttons"] for button in row]
+    assert action_types == ["text", "text", "text", "text"]
     payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
     assert [payload["vkcl"] for payload in payloads] == ["0", "1", "2", "other"]
     assert {payload["id"] for payload in payloads} == {"clarify-1"}
@@ -1696,6 +1698,53 @@ async def test_vk_clarify_callback_resolves_choice_and_removes_buttons(monkeypat
     removed_keyboard = json.loads(edit_calls[0]["keyboard"])
     assert removed_keyboard["inline"] is True
     assert removed_keyboard["buttons"] == []
+
+
+@pytest.mark.asyncio
+async def test_vk_clarify_text_button_message_new_payload_resolves_choice(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
+    session_key = "agent:main:vk:thread:2000000042:lane:gito"
+    adapter._clarify_state["clarify-text"] = session_key
+    adapter.handle_message = AsyncMock()
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": {"items": []}}
+
+    adapter._vk_method = fake_vk_method
+
+    from tools import clarify_gateway
+    clarify_gateway.register(
+        clarify_id="clarify-text",
+        session_key=session_key,
+        question="Pick one",
+        choices=["First choice", "Second choice"],
+    )
+    try:
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
+            await adapter._handle_update(
+                {
+                    "type": "message_new",
+                    "object": {
+                        "message": {
+                            "from_id": 100,
+                            "peer_id": 2000000042,
+                            "conversation_message_id": 58,
+                            "text": "2",
+                            "payload": json.dumps({"vkcl": "1", "id": "clarify-text"}),
+                        }
+                    },
+                }
+            )
+    finally:
+        clarify_gateway.clear_session(session_key)
+
+    resolve.assert_called_once_with("clarify-text", "Second choice")
+    adapter.handle_message.assert_not_awaited()
+    assert "clarify-text" not in adapter._clarify_state
+
 
 
 @pytest.mark.asyncio

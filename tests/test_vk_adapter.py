@@ -646,7 +646,49 @@ async def test_project_alias_one_shot_routes_without_changing_active_lane(monkey
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "задача"
     assert event.source.thread_id == "lane:tccc-ai"
-    assert adapter._get_active_lane_id("2000000042", "100") is None
+
+
+@pytest.mark.asyncio
+async def test_vk_button_text_mentions_are_stripped_before_gateway_message(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "240237574",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {"id": "tccc-ai", "name": "TCCC AI", "aliases": ["tccc"], "workdir": "", "skills": []}
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+    await adapter._set_active_lane_id("2000000042", "100", "tccc-ai")
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 15,
+                    "text": "[club240237574|@club240237574] 3",
+                }
+            },
+        }
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "3"
+    assert event.source.thread_id == "lane:tccc-ai"
 
 
 @pytest.mark.asyncio

@@ -2145,6 +2145,8 @@ class VKAdapter(BasePlatformAdapter):
         if not text and not media_urls:
             return
         control_text = self._strip_bot_mention_prefix(text)
+        if control_text != text:
+            text = control_text
 
         try:
             raw_button_payload = msg.get("payload") or {}

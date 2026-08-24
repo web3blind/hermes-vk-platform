@@ -1,11 +1,38 @@
+import importlib.util
 import json
 import os
 import sqlite3
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+
+def _load_local_vk_plugin_module(module_name: str, file_name: str) -> None:
+    local_root = Path(__file__).resolve().parents[1]
+    module_path = local_root / file_name
+    for package_name in ("plugins", "plugins.platforms", "plugins.platforms.vk"):
+        if package_name not in sys.modules:
+            package = types.ModuleType(package_name)
+            package.__path__ = []  # type: ignore[attr-defined]
+            sys.modules[package_name] = package
+    sys.modules["plugins"].platforms = sys.modules["plugins.platforms"]
+    sys.modules["plugins.platforms"].vk = sys.modules["plugins.platforms.vk"]
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {module_name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    setattr(sys.modules["plugins.platforms.vk"], module_name.rsplit(".", 1)[-1], module)
+
+
+_load_local_vk_plugin_module("plugins.platforms.vk.adapter", "adapter.py")
+_load_local_vk_plugin_module("plugins.platforms.vk.setup_helper", "setup_helper.py")
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
@@ -1397,6 +1424,175 @@ async def test_project_message_event_select_sets_active_lane_without_agent_dispa
     adapter.handle_message.assert_not_awaited()
     assert adapter._get_active_lane_id("2000000042", "100") == "tccc-ai"
     assert any(call[0] == "messages.sendMessageEventAnswer" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_vk_send_exec_approval_renders_full_button_set(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 77}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send_exec_approval(
+        chat_id="2000000042",
+        command="touch /tmp/demo",
+        session_key="agent:main:vk:thread:2000000042:lane:gito",
+        description="dangerous command",
+    )
+
+    assert result.success is True
+    assert result.message_id == "cmid:77"
+    send_params = [params for method, params in calls if method == "messages.send"][0]
+    assert "Command Approval Required" in send_params["message"]
+    keyboard = json.loads(send_params["keyboard"])
+    assert keyboard["inline"] is True
+    labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
+    assert labels == ["✅ Allow Once", "✅ Session", "✅ Always", "❌ Deny"]
+    payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
+    assert [payload["vkea"] for payload in payloads] == ["once", "session", "always", "deny"]
+    assert len({payload["id"] for payload in payloads}) == 1
+    assert adapter._approval_state[payloads[0]["id"]] == "agent:main:vk:thread:2000000042:lane:gito"
+
+
+@pytest.mark.asyncio
+async def test_vk_send_exec_approval_smart_deny_renders_two_buttons(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 78}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send_exec_approval(
+        chat_id="2000000042",
+        command="curl example.test",
+        session_key="s",
+        allow_permanent=False,
+        smart_denied=True,
+    )
+
+    assert result.success is True
+    keyboard = json.loads([params for method, params in calls if method == "messages.send"][0]["keyboard"])
+    labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
+    assert labels == ["✅ Allow Once", "❌ Deny"]
+
+
+@pytest.mark.asyncio
+async def test_vk_exec_approval_callback_resolves_and_edits_prompt(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
+    adapter._approval_state[5] = "agent:main:vk:thread:2000000042:lane:gito"
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+        await adapter._handle_update(
+            {
+                "type": "message_event",
+                "object": {
+                    "peer_id": 2000000042,
+                    "user_id": 100,
+                    "event_id": "evt-approval",
+                    "conversation_message_id": 55,
+                    "payload": {"vkea": "session", "id": 5},
+                },
+            }
+        )
+
+    resolve.assert_called_once_with("agent:main:vk:thread:2000000042:lane:gito", "session")
+    assert 5 not in adapter._approval_state
+    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    assert edit_calls and edit_calls[0]["conversation_message_id"] == "55"
+    assert "Approved for session" in edit_calls[0]["message"]
+    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
+    assert removed_keyboard["inline"] is True
+    assert removed_keyboard["buttons"] == []
+
+
+@pytest.mark.asyncio
+async def test_vk_send_slash_confirm_renders_three_buttons(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 88}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send_slash_confirm(
+        chat_id="2000000042",
+        title="/reload-mcp",
+        message="Approve reload?",
+        session_key="agent:main:vk:group:2000000042:100",
+        confirm_id="confirm-1",
+    )
+
+    assert result.success is True
+    assert result.message_id == "cmid:88"
+    send_params = [params for method, params in calls if method == "messages.send"][0]
+    keyboard = json.loads(send_params["keyboard"])
+    labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
+    assert labels == ["✅ Approve Once", "🔒 Always Approve", "❌ Cancel"]
+    payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
+    assert [payload["vksc"] for payload in payloads] == ["once", "always", "cancel"]
+    assert adapter._slash_confirm_state["confirm-1"] == "agent:main:vk:group:2000000042:100"
+
+
+@pytest.mark.asyncio
+async def test_vk_slash_confirm_callback_resolves_edits_and_sends_result(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
+    adapter._slash_confirm_state["confirm-1"] = "agent:main:vk:group:2000000042:100"
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    async def fake_resolve(session_key, confirm_id, choice):
+        assert session_key == "agent:main:vk:group:2000000042:100"
+        assert confirm_id == "confirm-1"
+        assert choice == "always"
+        return "Reload complete"
+
+    with patch("tools.slash_confirm.resolve", fake_resolve):
+        await adapter._handle_update(
+            {
+                "type": "message_event",
+                "object": {
+                    "peer_id": 2000000042,
+                    "user_id": 100,
+                    "event_id": "evt-confirm",
+                    "conversation_message_id": 56,
+                    "payload": {"vksc": "always", "id": "confirm-1"},
+                },
+            }
+        )
+
+    assert "confirm-1" not in adapter._slash_confirm_state
+    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    assert edit_calls and "Always approve" in edit_calls[0]["message"]
+    send_calls = [params for method, params in calls if method == "messages.send"]
+    assert send_calls and send_calls[-1]["message"] == "Reload complete"
 
 
 @pytest.mark.asyncio

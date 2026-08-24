@@ -874,6 +874,9 @@ class VKAdapter(BasePlatformAdapter):
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
         self._seen_message_keys: dict[str, float] = {}
         self._seen_edit_keys: dict[str, float] = {}
+        self._approval_counter = 0
+        self._approval_state: dict[int, str] = {}
+        self._slash_confirm_state: dict[str, str] = {}
         try:
             raw_project_lanes = extra.get("project_lanes")
             raw_platforms = extra.get("platforms") if isinstance(extra.get("platforms"), dict) else None
@@ -1376,6 +1379,52 @@ class VKAdapter(BasePlatformAdapter):
             ensure_ascii=False,
         )
 
+    @staticmethod
+    def _inline_callback_keyboard(buttons: list[tuple[str, dict[str, Any]]], *, row_size: int = 2) -> str:
+        rows: list[list[dict[str, Any]]] = []
+        row: list[dict[str, Any]] = []
+        for label, payload_obj in buttons:
+            row.append(
+                {
+                    "action": {
+                        "type": "callback",
+                        "label": label,
+                        "payload": json.dumps(payload_obj, ensure_ascii=False),
+                    }
+                }
+            )
+            if len(row) >= row_size:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
+
+    def _exec_approval_keyboard(self, approval_id: int, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> str:
+        buttons: list[tuple[str, dict[str, Any]]] = [
+            ("✅ Allow Once", {"vkea": "once", "id": approval_id}),
+        ]
+        if not smart_denied and allow_session:
+            buttons.append(("✅ Session", {"vkea": "session", "id": approval_id}))
+            if allow_permanent:
+                buttons.append(("✅ Always", {"vkea": "always", "id": approval_id}))
+        buttons.append(("❌ Deny", {"vkea": "deny", "id": approval_id}))
+        return self._inline_callback_keyboard(buttons, row_size=2)
+
+    def _slash_confirm_keyboard(self, confirm_id: str) -> str:
+        return self._inline_callback_keyboard(
+            [
+                ("✅ Approve Once", {"vksc": "once", "id": confirm_id}),
+                ("🔒 Always Approve", {"vksc": "always", "id": confirm_id}),
+                ("❌ Cancel", {"vksc": "cancel", "id": confirm_id}),
+            ],
+            row_size=2,
+        )
+
+    @staticmethod
+    def _empty_inline_keyboard() -> str:
+        return json.dumps({"one_time": False, "inline": True, "buttons": []}, ensure_ascii=False)
+
     def _project_selected_keyboard(self, peer_id: str, lane_id: str) -> str:
         is_pinned = self._is_pinned_lane(peer_id, lane_id)
         action = "unpin" if is_pinned else "pin"
@@ -1590,6 +1639,78 @@ class VKAdapter(BasePlatformAdapter):
                 payload = {}
         else:
             payload = raw_payload if isinstance(raw_payload, dict) else {}
+
+        if payload.get("vkea") is not None:
+            choice = str(payload.get("vkea") or "")
+            if choice not in {"once", "session", "always", "deny"}:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
+                return
+            try:
+                approval_id = int(payload.get("id"))
+            except (TypeError, ValueError):
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
+                return
+            session_key = self._approval_state.pop(approval_id, None)
+            if not session_key:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Подтверждение уже обработано или устарело")
+                return
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                count = resolve_gateway_approval(session_key, choice)
+            except Exception as exc:
+                logger.error("VK: failed to resolve approval button — %s", _redact_token(str(exc)), exc_info=True)
+                count = 0
+            if count:
+                label_map = {
+                    "once": "✅ Approved once",
+                    "session": "✅ Approved for session",
+                    "always": "✅ Approved permanently",
+                    "deny": "❌ Denied",
+                }
+                label = label_map.get(choice, "Resolved")
+                try:
+                    self.resume_typing_for_chat(str(peer_id))
+                except Exception:
+                    pass
+            else:
+                label = "⌛ Approval expired"
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
+            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
+            if message_id:
+                await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+            return
+
+        if payload.get("vksc") is not None:
+            choice = str(payload.get("vksc") or "")
+            if choice not in {"once", "always", "cancel"}:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
+                return
+            confirm_id = str(payload.get("id") or "")
+            session_key = self._slash_confirm_state.pop(confirm_id, None)
+            if not confirm_id or not session_key:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Подтверждение уже обработано или устарело")
+                return
+            label_map = {
+                "once": "✅ Approved once",
+                "always": "🔒 Always approve",
+                "cancel": "❌ Cancelled",
+            }
+            label = label_map.get(choice, "Resolved")
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
+            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
+            if message_id:
+                await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+            try:
+                from tools import slash_confirm as _slash_confirm_mod
+
+                result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+                if result_text:
+                    await self._send_project_text(peer_id, result_text)
+            except Exception as exc:
+                logger.error("VK: slash-confirm callback failed — %s", _redact_token(str(exc)), exc_info=True)
+            return
+
         if payload.get("vkpl") is None:
             return
         action = str(payload.get("vkpl") or "")
@@ -2794,6 +2915,89 @@ class VKAdapter(BasePlatformAdapter):
             return self._format_attachment_ref("video", response)
 
         return await _retry_vk_transient_once("video upload", op)
+
+    def _format_exec_approval(self, command: str, description: str, smart_denied: bool = False) -> str:
+        cmd_preview = command if len(command) <= 1500 else command[:1500] + "..."
+        text = (
+            "⚠️ Command Approval Required\n\n"
+            f"Command:\n```\n{cmd_preview}\n```\n"
+            f"Reason: {description}"
+        )
+        if smart_denied:
+            text += "\n\nSmart DENY: owner override applies to this one operation only."
+        return text
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Send a VK inline-keyboard dangerous-command approval prompt.
+
+        This implements the gateway's native button approval contract while
+        keeping the gateway text fallback available if sending fails.
+        """
+        if not self.token:
+            return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
+        try:
+            self._approval_counter += 1
+            approval_id = self._approval_counter
+            params = {
+                "peer_ids": str(chat_id),
+                "message": self.format_message(self._format_exec_approval(command, description, smart_denied)),
+                "random_id": random.randint(1, 2_147_483_647),
+                "keyboard": self._exec_approval_keyboard(
+                    approval_id,
+                    allow_permanent=allow_permanent,
+                    allow_session=allow_session,
+                    smart_denied=smart_denied,
+                ),
+            }
+            payload = await self._vk_method("messages.send", params)
+            message_id = self._sent_message_id(payload)
+            self._approval_state[approval_id] = session_key
+            thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            if thread_id and message_id:
+                await self._remember_message_lane(str(chat_id), message_id, thread_id)
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a VK inline-keyboard slash-command confirmation prompt."""
+        if not self.token:
+            return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
+        try:
+            prompt = f"{title}\n\n{message}" if title else message
+            params = {
+                "peer_ids": str(chat_id),
+                "message": self.format_message(prompt),
+                "random_id": random.randint(1, 2_147_483_647),
+                "keyboard": self._slash_confirm_keyboard(confirm_id),
+            }
+            payload = await self._vk_method("messages.send", params)
+            message_id = self._sent_message_id(payload)
+            self._slash_confirm_state[str(confirm_id)] = session_key
+            thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
+            if thread_id and message_id:
+                await self._remember_message_lane(str(chat_id), message_id, thread_id)
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
 
     async def send(
         self,

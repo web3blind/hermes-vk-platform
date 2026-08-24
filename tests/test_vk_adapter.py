@@ -1596,6 +1596,223 @@ async def test_vk_slash_confirm_callback_resolves_edits_and_sends_result(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {"id": "gito", "name": "Gito", "folder": "/tmp/gito", "skills": ["coding"]}
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 91}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send_clarify(
+        chat_id="2000000042",
+        question="Разрешаешь обновить kernel/headers?",
+        choices=["Да, поставить и перезагрузить", "Поставить без reboot", "Искать другой протокол"],
+        clarify_id="clarify-1",
+        session_key="agent:main:vk:thread:2000000042:lane:gito",
+        metadata={"thread_id": "lane:gito"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "cmid:91"
+    send_params = [params for method, params in calls if method == "messages.send"][0]
+    assert "❓ Разрешаешь обновить kernel/headers?" in send_params["message"]
+    assert "1. Да, поставить и перезагрузить" in send_params["message"]
+    assert "3. Искать другой протокол" in send_params["message"]
+    keyboard = json.loads(send_params["keyboard"])
+    assert keyboard["inline"] is True
+    labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
+    assert labels == ["1", "2", "3", "✏️ Свой ответ"]
+    payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
+    assert [payload["vkcl"] for payload in payloads] == ["0", "1", "2", "other"]
+    assert {payload["id"] for payload in payloads} == {"clarify-1"}
+    assert adapter._clarify_state["clarify-1"] == "agent:main:vk:thread:2000000042:lane:gito"
+    assert adapter._lane_state["message_lanes"]["2000000042:91"] == "gito"
+
+
+@pytest.mark.asyncio
+async def test_vk_clarify_callback_resolves_choice_and_removes_buttons(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
+    session_key = "agent:main:vk:thread:2000000042:lane:gito"
+    adapter._clarify_state["clarify-1"] = session_key
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    from tools import clarify_gateway
+    clarify_gateway.register(
+        clarify_id="clarify-1",
+        session_key=session_key,
+        question="Pick one",
+        choices=["First choice", "Second choice", "Third choice"],
+    )
+    try:
+        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
+            await adapter._handle_update(
+                {
+                    "type": "message_event",
+                    "object": {
+                        "peer_id": 2000000042,
+                        "user_id": 100,
+                        "event_id": "evt-clarify",
+                        "conversation_message_id": 57,
+                        "payload": {"vkcl": "1", "id": "clarify-1"},
+                    },
+                }
+            )
+    finally:
+        clarify_gateway.clear_session(session_key)
+
+    resolve.assert_called_once_with("clarify-1", "Second choice")
+    assert "clarify-1" not in adapter._clarify_state
+    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    assert edit_calls and edit_calls[0]["conversation_message_id"] == "57"
+    assert "Second choice" in edit_calls[0]["message"]
+    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
+    assert removed_keyboard["inline"] is True
+    assert removed_keyboard["buttons"] == []
+
+
+@pytest.mark.asyncio
+async def test_vk_clarify_other_callback_switches_to_text_capture(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
+    adapter._clarify_state["clarify-2"] = "agent:main:vk:group:2000000042:100"
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 1}]}
+
+    adapter._vk_method = fake_vk_method
+
+    with patch("tools.clarify_gateway.mark_awaiting_text", return_value=True) as mark:
+        await adapter._handle_update(
+            {
+                "type": "message_event",
+                "object": {
+                    "peer_id": 2000000042,
+                    "user_id": 100,
+                    "event_id": "evt-clarify-other",
+                    "conversation_message_id": 58,
+                    "payload": {"vkcl": "other", "id": "clarify-2"},
+                },
+            }
+        )
+
+    mark.assert_called_once_with("clarify-2")
+    assert adapter._clarify_state["clarify-2"] == "agent:main:vk:group:2000000042:100"
+    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
+    edit_calls = [params for method, params in calls if method == "messages.edit"]
+    assert edit_calls and edit_calls[0]["conversation_message_id"] == "58"
+    assert "Напиши свой ответ" in edit_calls[0]["message"]
+    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
+    assert removed_keyboard["inline"] is True
+    assert removed_keyboard["buttons"] == []
+
+
+@pytest.mark.asyncio
+async def test_vk_send_clarify_oversized_choices_uses_numbered_text_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]}))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 92}]}
+
+    adapter._vk_method = fake_vk_method
+
+    result = await adapter.send_clarify(
+        chat_id="2000000042",
+        question="Выбери одиннадцать?",
+        choices=[f"Choice {idx}" for idx in range(1, 12)],
+        clarify_id="clarify-big",
+        session_key="agent:main:vk:group:2000000042:100",
+    )
+
+    assert result.success is True
+    send_params = [params for method, params in calls if method == "messages.send"][0]
+    assert "11. Choice 11" in send_params["message"]
+    assert "Reply with the number" in send_params["message"]
+    assert "keyboard" in send_params  # default project keyboard remains, not clarify inline buttons
+    keyboard = json.loads(send_params["keyboard"])
+    payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
+    assert not any("vkcl" in payload for payload in payloads)
+    assert "clarify-big" not in adapter._clarify_state
+
+
+@pytest.mark.asyncio
+async def test_vk_reply_to_clarify_prompt_restores_lane_for_text_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [
+                            {"id": "gito", "name": "Gito", "folder": "/tmp/gito", "skills": ["coding"]}
+                        ]
+                    }
+                },
+            },
+        )
+    )
+    adapter._lane_state.setdefault("message_lanes", {})["2000000042:92"] = "gito"
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 93,
+                    "text": "2",
+                    "reply_message": {"conversation_message_id": 92},
+                }
+            },
+        }
+    )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "2"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "lane:gito"
+    assert build_session_key(event.source) == "agent:main:vk:thread:2000000042:lane:gito"
+
+
+@pytest.mark.asyncio
 async def test_vk_message_new_duplicate_is_ignored_before_enrichment_and_download():
     adapter = VKAdapter(
         PlatformConfig(

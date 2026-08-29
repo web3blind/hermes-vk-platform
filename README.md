@@ -18,6 +18,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - If VK `video.save` rejects an MP4 with auth/permission errors under group-token auth, video delivery falls back to sending the MP4 as a document attachment.
 - Markdown-style Hermes output is converted to VK-readable plain text because the regular VK `messages.send` API has no Telegram-like `parse_mode` for Markdown/HTML.
 - Optional per-channel prompts and skill bindings through Hermes config.
+- Optional Telegram-style message-reaction acks (`VK_REACTIONS_ENABLED`): a progress reaction while the agent works, then 👍/👎 on completion.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
 
 ## Documentation
@@ -176,6 +177,35 @@ VK_DEDUPE_TTL_SECONDS=1800
 # Optional user token for video metadata fallback. Not needed for normal chat usage.
 VK_USER_TOKEN=
 ```
+
+### Message reactions (👌 → 👍/👎)
+
+Optional Telegram-style processing acks. When enabled, the bot reacts to the
+incoming message with a "seen, working on it" reaction as soon as processing
+starts, and swaps it for a final 👍 (success) or 👎 (failure) reaction when the
+agent finishes. Reactions are cosmetic: API failures never break message flow.
+
+```dotenv
+VK_REACTIONS_ENABLED=true
+```
+
+VK identifies reactions by numeric id, not emoji. The default community set:
+`1`=❤️ `2`=🔥 `3`=😂 `4`=👍 `8`=😡 `10`=👌 `16`=🎉. Defaults: progress `10`
+(👌 — there is no 👀 in the VK default set), OK `4` (👍), FAIL `8`. If your
+community rearranged reactions, override any step:
+
+```dotenv
+# Defaults shown:
+VK_REACTION_PROGRESS=10
+VK_REACTION_OK=4
+VK_REACTION_FAIL=8
+```
+
+Set a step to `0` to disable it (e.g. `VK_REACTION_PROGRESS=0` to only mark
+final outcomes). On cancelled/interrupted turns the progress reaction is
+removed. Requires the community token to have the messages permission; some
+very old API versions do not expose `messages.deleteReaction` — the adapter
+probes support lazily and degrades gracefully.
 
 ## Optional YAML config
 

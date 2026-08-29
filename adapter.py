@@ -33,6 +33,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     resolve_channel_prompt,
     resolve_channel_skills,
@@ -47,6 +48,15 @@ DEFAULT_DEDUPE_TTL_SECONDS = 30 * 60
 VK_TRANSIENT_RETRY_DELAY_SECONDS = 5.0
 VALID_ACCESS_POLICIES = {"any", "user_only", "peer_only", "peer_and_user"}
 DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "application/octet-stream")
+
+# VK message reactions are identified by community-scoped numeric ids, not
+# emoji. Common default set (per nanobot-channel-vk's README):
+# 1=❤️ 2=🔥 3=😂 4=👍 8=😡 10=👌 16=🎉. There is no 👀 in the default set,
+# so the intake ack uses 👌; communities that rearrange reactions can override
+# via VK_REACTION_PROGRESS / VK_REACTION_OK / VK_REACTION_FAIL. 0 = disabled.
+_VK_REACTION_OK = 4  # 👍
+_VK_REACTION_FAIL = 8  # override via VK_REACTION_FAIL if the community map differs
+_VK_REACTION_PROGRESS_DEFAULT = 10  # 👌 — "seen, working on it"
 
 
 def _truthy(value: Any) -> bool:
@@ -505,6 +515,14 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _parse_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
     """Parse per-peer user allowlists from config/env.
 
@@ -866,6 +884,24 @@ class VKAdapter(BasePlatformAdapter):
         self.max_message_length = int(extra.get("max_message_length") or 4096)
         self.download_attachments = _truthy(os.getenv("VK_DOWNLOAD_ATTACHMENTS") or extra.get("download_attachments"))
 
+        # Message-reaction acks (mirrors Telegram's 👀 → ✅/❌ lifecycle):
+        # progress reaction on intake, swapped for OK/FAIL when processing
+        # completes. VK identifies reactions by numeric id, not emoji; ids are
+        # community-scoped, so the common defaults are exposed as env vars
+        # (see the _VK_REACTION_* constants). 0 disables a step.
+        self.reactions_enabled = _truthy(os.getenv("VK_REACTIONS_ENABLED") or extra.get("reactions_enabled"))
+        self.reaction_progress = _parse_non_negative_int(
+            os.getenv("VK_REACTION_PROGRESS") or extra.get("reaction_progress"),
+            _VK_REACTION_PROGRESS_DEFAULT,
+        )
+        self.reaction_ok = _parse_non_negative_int(
+            os.getenv("VK_REACTION_OK") or extra.get("reaction_ok"), _VK_REACTION_OK
+        )
+        self.reaction_fail = _parse_non_negative_int(
+            os.getenv("VK_REACTION_FAIL") or extra.get("reaction_fail"), _VK_REACTION_FAIL
+        )
+        self._delete_reaction_supported: Optional[bool] = None
+
         self._poll_task: Optional[asyncio.Task] = None
         self._lp_server = ""
         self._lp_key = ""
@@ -963,6 +999,99 @@ class VKAdapter(BasePlatformAdapter):
         merged.setdefault("access_token", access_token or self.token)
         merged.setdefault("v", self.api_version)
         return await _http_json_async(f"{VK_API_BASE}/{method}", merged)
+
+    # ── Message-reaction ack lifecycle (👌 → 👍/👎) ────────────────────────
+
+    async def _send_reaction(self, chat_id: Any, message_id: Any, reaction_id: int) -> bool:
+        """Set a numeric reaction on a peer message. Best-effort (False on failure).
+
+        ``message_id`` is the VK conversation_message_id (cmid), which is what
+        MessageEvent.message_id carries for inbound messages.
+        """
+        try:
+            peer_id = int(str(chat_id).strip())
+            cmid = int(str(message_id).strip())
+            reaction = int(reaction_id)
+        except (TypeError, ValueError):
+            return False
+        try:
+            result = await self._vk_method(
+                "messages.sendReaction",
+                {"peer_id": peer_id, "cmid": cmid, "reaction_id": reaction},
+            )
+        except Exception as exc:
+            logger.debug("VK: sendReaction failed — %s", _redact_token(str(exc)))
+            return False
+        if "error" in result:
+            logger.debug(
+                "VK: sendReaction error %s — %s",
+                result["error"].get("error_code"),
+                result["error"].get("error_msg", ""),
+            )
+            return False
+        return bool(result.get("response"))
+
+    async def _remove_reacted(self, chat_id: str, message_id: str) -> bool:
+        """Remove our reaction from a message. Soft-fails (False), never raises.
+
+        A community token can only retract the reaction it set itself. Some API
+        versions do not expose ``messages.deleteReaction``; the first call
+        records support in ``_delete_reaction_supported`` so later calls skip
+        the API round-trip when the method is unavailable.
+        """
+        if self._delete_reaction_supported is False:
+            return False
+        try:
+            peer_id = int(str(chat_id).strip())
+            cmid = int(str(message_id).strip())
+        except (TypeError, ValueError):
+            return False
+        try:
+            result = await self._vk_method(
+                "messages.deleteReaction", {"peer_id": peer_id, "cmid": cmid}
+            )
+        except Exception as exc:
+            logger.debug("VK: deleteReaction failed — %s", _redact_token(str(exc)))
+            return False
+        err = result.get("error") or {}
+        if err.get("error_code") == 3:  # Unknown method passed
+            self._delete_reaction_supported = False
+            return False
+        if "error" in result:
+            logger.debug("VK: deleteReaction error %s — %s", err.get("error_code"), err.get("error_msg", ""))
+            return False
+        self._delete_reaction_supported = True
+        return bool(result.get("response"))
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Set the progress reaction on the triggering message while the agent works."""
+        if not self.reactions_enabled:
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if chat_id and message_id and self.reaction_progress > 0:
+            await self._send_reaction(chat_id, message_id, self.reaction_progress)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Swap the progress reaction for a final OK/FAIL reaction (VK numeric ids)."""
+        if not self.reactions_enabled:
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            if self.reaction_progress > 0:
+                await self._remove_reacted(str(chat_id), str(message_id))
+            return
+        final_id = self.reaction_ok if outcome == ProcessingOutcome.SUCCESS else self.reaction_fail
+        if final_id <= 0:
+            await self._remove_reacted(str(chat_id), str(message_id))
+            return
+        # VK replaces a sender's previous reaction on sendReaction, so sending
+        # the final id directly replaces the intake ack. Communities that
+        # disable the progress reaction (0) just get the final one.
+        await self._send_reaction(chat_id, message_id, final_id)
 
     def _state_key(self, peer_id: str, user_id: str) -> str:
         return f"{peer_id}:{user_id}"

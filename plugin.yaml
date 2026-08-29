@@ -56,6 +56,22 @@ optional_env:
     description: "Download all inbound VK attachments to the Hermes cache (true/false)"
     prompt: "Download inbound attachments?"
     secret: false
+  - name: VK_REACTIONS_ENABLED
+    description: "Message-reaction acks: progress reaction on intake, OK/FAIL on completion (true/false)"
+    prompt: "Enable message reactions? (true/false)"
+    secret: false
+  - name: VK_REACTION_PROGRESS
+    description: "Numeric reaction id set while the agent is processing (0 = off; default 10 = 👌)"
+    prompt: "Progress reaction id"
+    secret: false
+  - name: VK_REACTION_OK
+    description: "Numeric reaction id set on successful processing (default 4 = 👍)"
+    prompt: "OK reaction id"
+    secret: false
+  - name: VK_REACTION_FAIL
+    description: "Numeric reaction id set on processing failure (default 8; 0 = off)"
+    prompt: "FAIL reaction id"
+    secret: false
   - name: VK_USER_TOKEN
     description: "Optional user token for VK video metadata fallback; not needed for normal text/chat usage"
     prompt: "Optional VK user token"

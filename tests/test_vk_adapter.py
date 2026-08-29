@@ -35,7 +35,7 @@ _load_local_vk_plugin_module("plugins.platforms.vk.adapter", "adapter.py")
 _load_local_vk_plugin_module("plugins.platforms.vk.setup_helper", "setup_helper.py")
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import MessageType
+from gateway.platforms.base import MessageType, MessageEvent, ProcessingOutcome
 from gateway.session import SessionSource, build_session_key
 from plugins.platforms.vk.adapter import (
     VKAdapter,
@@ -74,8 +74,12 @@ def clear_vk_env(monkeypatch):
         "VK_ACCESS_POLICY",
         "VK_ALLOWED_USERS_BY_PEER",
         "VK_DEDUPE_TTL_SECONDS",
-        "VK_MAX_ATTACHMENT_BYTES",
-    ):
+                "VK_MAX_ATTACHMENT_BYTES",
+                "VK_REACTIONS_ENABLED",
+                "VK_REACTION_PROGRESS",
+                "VK_REACTION_OK",
+                "VK_REACTION_FAIL",
+            ):
         monkeypatch.delenv(key, raising=False)
     # VK project-lane creation/editing can persist to config by design. Tests
     # must never mutate the real ~/.hermes/config.yaml; individual tests that
@@ -3097,3 +3101,185 @@ async def test_vk_standalone_send_keeps_legacy_two_argument_shape(monkeypatch):
     assert calls[0][1]["access_token"] == "env-token"
     assert calls[0][1]["peer_ids"] == "2000000042"
     assert calls[0][1]["message"] == "legacy"
+
+
+# ── Message-reaction ack lifecycle (👌 → 👍/👎) ─────────────────────────────
+
+
+def _register_vk_platform_once():
+    """Register 'vk' in the platform registry so Platform('vk') resolves.
+
+    Mirrors what the gateway's plugin loader does; needed because these tests
+    exercise the adapter directly without the plugin loader present.
+    """
+    from gateway.config import Platform
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    if platform_registry.is_registered("vk"):
+        return
+
+    module = sys.modules["plugins.platforms.vk.adapter"]
+
+    platform_registry.register(
+        PlatformEntry(
+            name="vk",
+            label="VK",
+            adapter_factory=module.VKAdapter,
+            check_fn=lambda: True,
+            source="plugin",
+            plugin_name="vk-platform",
+        )
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def vk_platform_registered():
+    _register_vk_platform_once()
+    yield
+
+
+def _reaction_platform():
+    return VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"})).platform
+
+
+def _reaction_adapter(monkeypatch, **extra):
+    """Adapter with reactions configured and VK API calls captured."""
+    calls = []
+
+    async def fake_http_json_async(url, params):
+        method = url.rsplit("/", 1)[-1]
+        calls.append((method, dict(params)))
+        if method == "messages.deleteReaction":
+            return {"response": 1}
+        return {"response": 1}
+
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", fake_http_json_async)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_id": "123456789", "reactions_enabled": True},
+        )
+    )
+    return adapter, calls
+
+
+def _reaction_event():
+    source = SessionSource(
+        platform=_reaction_platform(),
+        chat_id="100",
+        chat_name="Test User",
+        chat_type="dm",
+        user_id="100",
+    )
+    return MessageEvent(
+        text="ping",
+        message_type=MessageType.TEXT,
+        source=source,
+        raw_message={},
+        message_id="7",
+    )
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_disabled_by_default(monkeypatch):
+    calls = []
+
+    async def fake_http_json_async(url, params):
+        calls.append((url.rsplit("/", 1)[-1], dict(params)))
+        return {"response": 1}
+
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", fake_http_json_async)
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert calls == []
+    assert adapter.reactions_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_progress_then_ok(monkeypatch):
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert calls[0][0] == "messages.sendReaction"
+    assert calls[0][1]["peer_id"] == 100
+    assert calls[0][1]["cmid"] == 7
+    assert calls[0][1]["reaction_id"] == 10  # progress = 👌
+    assert calls[1][0] == "messages.sendReaction"
+    assert calls[1][1]["reaction_id"] == 4  # OK = 👍
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_failure_sets_fail_reaction(monkeypatch):
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    assert calls[0][1]["reaction_id"] == 10  # progress = 👌
+    assert calls[1][1]["reaction_id"] == 8  # FAIL default
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_cancelled_removes_progress(monkeypatch):
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+    assert calls[0][0] == "messages.sendReaction"
+    assert calls[1][0] == "messages.deleteReaction"
+    assert calls[1][1]["peer_id"] == 100
+    assert calls[1][1]["cmid"] == 7
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_custom_ids_from_env(monkeypatch):
+    monkeypatch.setenv("VK_REACTION_PROGRESS", "16")
+    monkeypatch.setenv("VK_REACTION_OK", "2")
+    monkeypatch.setenv("VK_REACTION_FAIL", "3")
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert adapter.reaction_progress == 16
+    assert calls[0][1]["reaction_id"] == 16
+    assert calls[1][1]["reaction_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_send_reaction_soft_fails(monkeypatch):
+    async def fake_http_json_async(url, params):
+        return {"error": {"error_code": 1009, "error_msg": "Unknown reaction passed"}}
+
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", fake_http_json_async)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, extra={"group_id": "123456789", "reactions_enabled": True})
+    )
+    event = _reaction_event()
+
+    # Must not raise — reactions are cosmetic.
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_skipped_without_message_id(monkeypatch):
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+    event.message_id = None
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert calls == []

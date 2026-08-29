@@ -74,12 +74,12 @@ def clear_vk_env(monkeypatch):
         "VK_ACCESS_POLICY",
         "VK_ALLOWED_USERS_BY_PEER",
         "VK_DEDUPE_TTL_SECONDS",
-                "VK_MAX_ATTACHMENT_BYTES",
-                "VK_REACTIONS_ENABLED",
-                "VK_REACTION_PROGRESS",
-                "VK_REACTION_OK",
-                "VK_REACTION_FAIL",
-            ):
+        "VK_MAX_ATTACHMENT_BYTES",
+        "VK_REACTIONS_ENABLED",
+        "VK_REACTION_PROGRESS",
+        "VK_REACTION_OK",
+        "VK_REACTION_FAIL",
+    ):
         monkeypatch.delenv(key, raising=False)
     # VK project-lane creation/editing can persist to config by design. Tests
     # must never mutate the real ~/.hermes/config.yaml; individual tests that
@@ -3255,6 +3255,24 @@ async def test_vk_reactions_custom_ids_from_env(monkeypatch):
     assert adapter.reaction_progress == 16
     assert calls[0][1]["reaction_id"] == 16
     assert calls[1][1]["reaction_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_vk_reactions_invalid_env_ids_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("VK_REACTION_PROGRESS", "not-an-int")
+    monkeypatch.setenv("VK_REACTION_OK", "-1")
+    monkeypatch.setenv("VK_REACTION_FAIL", "also-not-an-int")
+    adapter, calls = _reaction_adapter(monkeypatch)
+    event = _reaction_event()
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    assert adapter.reaction_progress == 10
+    assert adapter.reaction_ok == 4
+    assert adapter.reaction_fail == 8
+    assert calls[0][1]["reaction_id"] == 10
+    assert calls[1][1]["reaction_id"] == 8
 
 
 @pytest.mark.asyncio

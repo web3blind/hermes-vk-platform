@@ -515,6 +515,14 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _parse_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
     """Parse per-peer user allowlists from config/env.
 
@@ -882,11 +890,16 @@ class VKAdapter(BasePlatformAdapter):
         # community-scoped, so the common defaults are exposed as env vars
         # (see the _VK_REACTION_* constants). 0 disables a step.
         self.reactions_enabled = _truthy(os.getenv("VK_REACTIONS_ENABLED") or extra.get("reactions_enabled"))
-        self.reaction_progress = int(
-            os.getenv("VK_REACTION_PROGRESS") or extra.get("reaction_progress") or _VK_REACTION_PROGRESS_DEFAULT
+        self.reaction_progress = _parse_non_negative_int(
+            os.getenv("VK_REACTION_PROGRESS") or extra.get("reaction_progress"),
+            _VK_REACTION_PROGRESS_DEFAULT,
         )
-        self.reaction_ok = int(os.getenv("VK_REACTION_OK") or extra.get("reaction_ok") or _VK_REACTION_OK)
-        self.reaction_fail = int(os.getenv("VK_REACTION_FAIL") or extra.get("reaction_fail") or _VK_REACTION_FAIL)
+        self.reaction_ok = _parse_non_negative_int(
+            os.getenv("VK_REACTION_OK") or extra.get("reaction_ok"), _VK_REACTION_OK
+        )
+        self.reaction_fail = _parse_non_negative_int(
+            os.getenv("VK_REACTION_FAIL") or extra.get("reaction_fail"), _VK_REACTION_FAIL
+        )
         self._delete_reaction_supported: Optional[bool] = None
 
         self._poll_task: Optional[asyncio.Task] = None

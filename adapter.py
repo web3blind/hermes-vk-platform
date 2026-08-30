@@ -2362,6 +2362,10 @@ class VKAdapter(BasePlatformAdapter):
                 from_id = str(item.get("from_id") or "")
                 if not from_id or from_id.startswith("-"):
                     continue
+                cmid = item.get("conversation_message_id") or item.get("id")
+                if self._has_recent_message_key(peer_id=peer_id, conversation_message_id=cmid):
+                    logger.info("VK: ignoring duplicate event peer=%s cmid=%s", peer_id, cmid)
+                    continue
                 await self._handle_update({"type": "message_new", "object": {"message": item}})
                 handled += 1
         return handled
@@ -2957,6 +2961,15 @@ class VKAdapter(BasePlatformAdapter):
                 logger.warning("VK: failed to download inbound attachment — %s", _redact_token(str(exc)))
                 materialized.append(url)
         return materialized
+
+    def _has_recent_message_key(self, *, peer_id: str, conversation_message_id: Any) -> bool:
+        if not peer_id or conversation_message_id in (None, "") or self.dedupe_ttl_seconds <= 0:
+            return False
+        now = time.monotonic()
+        expired = [key for key, expires_at in self._seen_message_keys.items() if expires_at <= now]
+        for key in expired:
+            self._seen_message_keys.pop(key, None)
+        return f"{peer_id}:{conversation_message_id}" in self._seen_message_keys
 
     def _is_duplicate_event(self, *, peer_id: str, conversation_message_id: Any) -> bool:
         if not peer_id or conversation_message_id in (None, "") or self.dedupe_ttl_seconds <= 0:

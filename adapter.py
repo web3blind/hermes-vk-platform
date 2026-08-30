@@ -915,6 +915,7 @@ class VKAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._fallback_poll_task: Optional[asyncio.Task] = None
         self._fallback_last_cmid: dict[str, int] = {}
+        self._fallback_bootstrapped_logged = False
         self._lp_server = ""
         self._lp_key = ""
         self._lp_ts = ""
@@ -2318,7 +2319,7 @@ class VKAdapter(BasePlatformAdapter):
                 self._fallback_last_cmid[peer_id] = await self._discover_latest_cmid(peer_id)
             except Exception as exc:
                 logger.debug("VK: fallback bootstrap failed peer=%s — %s", peer_id, _redact_token(str(exc)))
-        if self._fallback_last_cmid:
+        if self._fallback_last_cmid and not self._fallback_bootstrapped_logged:
             sample = ", ".join(
                 f"{peer}:{cmid}" for peer, cmid in sorted(self._fallback_last_cmid.items())[:20]
             )
@@ -2327,6 +2328,7 @@ class VKAdapter(BasePlatformAdapter):
                 len(self._fallback_last_cmid),
                 sample,
             )
+            self._fallback_bootstrapped_logged = True
 
     async def _fallback_poll_once(self) -> int:
         await self._bootstrap_fallback_poll()

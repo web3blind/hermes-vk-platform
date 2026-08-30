@@ -180,25 +180,7 @@ VK_DEDUPE_TTL_SECONDS=1800
 VK_USER_TOKEN=
 ```
 
-Gateway user tokens are short-lived unless VK grants offline access. They are optional and only improve media enrichment for attachments where the community token cannot expose a direct file URL.
-
-For your own install, create a VK app and keep its protected key on the Hermes host. The helper accepts either CLI flags or environment variables:
-
-```dotenv
-# VK app id used only for the gateway OAuth code exchange.
-VK_GATEWAY_APP_ID=123456
-
-# Optional; defaults to https://oauth.vk.com/blank.html.
-VK_GATEWAY_REDIRECT_URI=https://oauth.vk.com/blank.html
-
-# Optional; defaults to 8212 (photos + video + wall).
-VK_GATEWAY_SCOPE=8212
-
-# Optional; otherwise ~/.hermes/secrets/vk_app_<VK_GATEWAY_APP_ID>_client_secret.
-VK_GATEWAY_CLIENT_SECRET_FILE=/absolute/path/to/protected_key
-```
-
-Manage the token with:
+Gateway user tokens are short-lived unless VK grants offline access. Manage them with:
 
 ```bash
 # Print an OAuth URL for the user to open; the returned code is exchanged server-side.

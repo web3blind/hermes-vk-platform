@@ -67,7 +67,13 @@ In VK community settings, check:
 
 Some VK attachments expose only player/watch-page metadata. The plugin does not pretend those pages are direct files.
 
-For video metadata fallback, configure an explicit gateway `VK_USER_TOKEN`; normal text/chat use does not need it. Do not copy tokens from publishing workflows. Use the gateway lifecycle helper instead:
+For video metadata fallback, configure an explicit gateway `VK_USER_TOKEN`; normal text/chat use does not need it. Do not copy tokens from publishing workflows. Use the gateway lifecycle helper instead.
+
+Important constraints:
+
+- Other installs should create their own VK app and provide its app id/protected key via `VK_GATEWAY_APP_ID` and `VK_GATEWAY_CLIENT_SECRET_FILE` or equivalent CLI flags.
+- If the user is already authorized in a local VK browser session, opening the helper's OAuth URL may return a code quickly. If not, the user must log in/approve in VK; the helper cannot silently refresh a user token from only a community token.
+- Without VK `offline` access, the token is temporary and `token-status` must be checked before relying on video enrichment.
 
 ```bash
 python3 scripts/vk_gateway_user_token.py auth-url --scope 8212

@@ -22,10 +22,14 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CLIENT_ID = "54526246"
+DEFAULT_CLIENT_ID = "54526246"  # Local/default app; other installs should pass their own app id.
 DEFAULT_REDIRECT_URI = "https://oauth.vk.com/blank.html"
 DEFAULT_SCOPE = "8212"  # photos + video + wall; enough for video.get/media probes.
 DEFAULT_API_VERSION = "5.199"
+ENV_APP_ID_NAME = "VK_GATEWAY_APP_ID"
+ENV_REDIRECT_URI_NAME = "VK_GATEWAY_REDIRECT_URI"
+ENV_SCOPE_NAME = "VK_GATEWAY_SCOPE"
+ENV_CLIENT_SECRET_FILE_NAME = "VK_GATEWAY_CLIENT_SECRET_FILE"
 TOKEN_SECRET_NAME = "vk_gateway_user_token"
 TOKEN_META_NAME = "vk_gateway_user_token_meta.json"
 ENV_TOKEN_NAME = "VK_USER_TOKEN"
@@ -70,16 +74,33 @@ def vk_request(endpoint: str, params: dict[str, Any], token: str | None = None) 
         return {"error": {"error_code": "request_failed", "error_msg": str(exc)[:300]}}
 
 
-def client_secret_path(home: Path, explicit: str | None = None) -> Path:
+def _default_client_id() -> str:
+    return os.environ.get(ENV_APP_ID_NAME, "").strip() or DEFAULT_CLIENT_ID
+
+
+def _default_redirect_uri() -> str:
+    return os.environ.get(ENV_REDIRECT_URI_NAME, "").strip() or DEFAULT_REDIRECT_URI
+
+
+def _default_scope() -> str:
+    return os.environ.get(ENV_SCOPE_NAME, "").strip() or DEFAULT_SCOPE
+
+
+def _default_client_secret_file() -> str | None:
+    return os.environ.get(ENV_CLIENT_SECRET_FILE_NAME, "").strip() or None
+
+
+def client_secret_path(home: Path, client_id: str, explicit: str | None = None) -> Path:
     if explicit:
         return Path(explicit).expanduser()
-    return home / "secrets" / f"vk_app_{DEFAULT_CLIENT_ID}_client_secret"
+    return home / "secrets" / f"vk_app_{client_id}_client_secret"
 
 
-def load_client_secret(home: Path, explicit: str | None = None) -> str:
-    path = client_secret_path(home, explicit)
+def load_client_secret(home: Path, client_id: str, explicit: str | None = None) -> str:
+    path = client_secret_path(home, client_id, explicit)
     if not path.exists():
-        raise SystemExit(_json({"ok": False, "error": "missing_client_secret", "path": str(path)}))
+        print(_json({"ok": False, "error": "missing_client_secret", "path": str(path)}))
+        raise SystemExit(2)
     return path.read_text(encoding="utf-8").strip()
 
 
@@ -125,26 +146,29 @@ def live_probe(token: str) -> dict[str, Any]:
 
 
 def command_auth_url(args: argparse.Namespace) -> int:
-    scope = args.scope or DEFAULT_SCOPE
+    client_id = args.client_id or _default_client_id()
+    redirect_uri = args.redirect_uri or _default_redirect_uri()
+    scope = args.scope or _default_scope()
     url = "https://oauth.vk.com/authorize?" + urllib.parse.urlencode(
         {
-            "client_id": args.client_id or DEFAULT_CLIENT_ID,
+            "client_id": client_id,
             "display": "page",
-            "redirect_uri": args.redirect_uri or DEFAULT_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "scope": scope,
             "response_type": "code",
             "v": DEFAULT_API_VERSION,
         }
     )
-    print(_json({"ok": True, "scope": scope, "auth_url": url, "stores_as": ENV_TOKEN_NAME}))
+    print(_json({"ok": True, "client_id": client_id, "redirect_uri": redirect_uri, "scope": scope, "auth_url": url, "stores_as": ENV_TOKEN_NAME}))
     return 0
 
 
 def command_exchange_code(args: argparse.Namespace) -> int:
     home = hermes_home()
-    client_id = args.client_id or DEFAULT_CLIENT_ID
-    redirect_uri = args.redirect_uri or DEFAULT_REDIRECT_URI
-    client_secret = load_client_secret(home, args.client_secret_path)
+    client_id = args.client_id or _default_client_id()
+    redirect_uri = args.redirect_uri or _default_redirect_uri()
+    scope = args.scope or _default_scope()
+    client_secret = load_client_secret(home, client_id, args.client_secret_path or _default_client_secret_file())
     token_data = vk_request(
         "access_token",
         {
@@ -180,7 +204,7 @@ def command_exchange_code(args: argparse.Namespace) -> int:
                     "source": "server_code_exchange",
                     "client_id": client_id,
                     "redirect_uri": redirect_uri,
-                    "refresh_scope": args.scope or DEFAULT_SCOPE,
+                    "refresh_scope": scope,
                     "scope_note": args.scope_note,
                     "env_key": ENV_TOKEN_NAME,
                     "secret_name": TOKEN_SECRET_NAME,
@@ -225,12 +249,14 @@ def command_token_status(args: argparse.Namespace) -> int:
     probe = live_probe(token) if token else {"ok": False, "error": "missing_token"}
     if not probe.get("ok"):
         needs_refresh = True
-    auth_scope = str(meta.get("refresh_scope") or args.scope or DEFAULT_SCOPE)
+    auth_scope = str(meta.get("refresh_scope") or args.scope or _default_scope())
+    client_id = str(meta.get("client_id") or args.client_id or _default_client_id())
+    redirect_uri = str(meta.get("redirect_uri") or args.redirect_uri or _default_redirect_uri())
     auth_url = "https://oauth.vk.com/authorize?" + urllib.parse.urlencode(
         {
-            "client_id": str(meta.get("client_id") or args.client_id or DEFAULT_CLIENT_ID),
+            "client_id": client_id,
             "display": "page",
-            "redirect_uri": str(meta.get("redirect_uri") or args.redirect_uri or DEFAULT_REDIRECT_URI),
+            "redirect_uri": redirect_uri,
             "scope": auth_scope,
             "response_type": "code",
             "v": DEFAULT_API_VERSION,
@@ -258,26 +284,26 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_auth = sub.add_parser("auth-url")
-    p_auth.add_argument("--scope", default=DEFAULT_SCOPE)
-    p_auth.add_argument("--client-id", default=DEFAULT_CLIENT_ID)
-    p_auth.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
+    p_auth.add_argument("--scope", default=None, help=f"OAuth scope; default env {ENV_SCOPE_NAME} or {DEFAULT_SCOPE}")
+    p_auth.add_argument("--client-id", default=None, help=f"VK app id; default env {ENV_APP_ID_NAME} or local default")
+    p_auth.add_argument("--redirect-uri", default=None, help=f"OAuth redirect URI; default env {ENV_REDIRECT_URI_NAME} or blank.html")
     p_auth.set_defaults(func=command_auth_url)
 
     p_exchange = sub.add_parser("exchange-code")
     p_exchange.add_argument("--code", required=True)
-    p_exchange.add_argument("--scope", default=DEFAULT_SCOPE)
+    p_exchange.add_argument("--scope", default=None, help=f"OAuth scope stored for refresh; default env {ENV_SCOPE_NAME} or {DEFAULT_SCOPE}")
     p_exchange.add_argument("--scope-note", default="photos+video+wall, no offline; gateway media enrichment")
-    p_exchange.add_argument("--client-id", default=DEFAULT_CLIENT_ID)
-    p_exchange.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
-    p_exchange.add_argument("--client-secret-path", default=None)
+    p_exchange.add_argument("--client-id", default=None, help=f"VK app id; default env {ENV_APP_ID_NAME} or local default")
+    p_exchange.add_argument("--redirect-uri", default=None, help=f"OAuth redirect URI; default env {ENV_REDIRECT_URI_NAME} or blank.html")
+    p_exchange.add_argument("--client-secret-path", default=None, help=f"Protected key path; default env {ENV_CLIENT_SECRET_FILE_NAME} or ~/.hermes/secrets/vk_app_<client_id>_client_secret")
     p_exchange.add_argument("--no-store", action="store_true")
     p_exchange.set_defaults(func=command_exchange_code)
 
     p_status = sub.add_parser("token-status")
     p_status.add_argument("--min-seconds-left", type=int, default=3600)
-    p_status.add_argument("--scope", default=DEFAULT_SCOPE)
-    p_status.add_argument("--client-id", default=DEFAULT_CLIENT_ID)
-    p_status.add_argument("--redirect-uri", default=DEFAULT_REDIRECT_URI)
+    p_status.add_argument("--scope", default=None, help=f"OAuth scope for refresh URL; default env {ENV_SCOPE_NAME} or {DEFAULT_SCOPE}")
+    p_status.add_argument("--client-id", default=None, help=f"VK app id; default env {ENV_APP_ID_NAME} or local default")
+    p_status.add_argument("--redirect-uri", default=None, help=f"OAuth redirect URI; default env {ENV_REDIRECT_URI_NAME} or blank.html")
     p_status.set_defaults(func=command_token_status)
 
     args = parser.parse_args()

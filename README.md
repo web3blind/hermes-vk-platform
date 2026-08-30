@@ -180,9 +180,9 @@ VK_DEDUPE_TTL_SECONDS=1800
 VK_USER_TOKEN=
 ```
 
-Gateway user tokens are short-lived unless VK grants offline access. They are optional and only improve media enrichment for attachments where the community token cannot expose a direct file URL.
+Gateway user tokens are short-lived unless VK grants offline access. They are optional and only improve media enrichment for attachments where the community token cannot expose a direct file URL. If no gateway app/user token is configured, the gateway does not fail: normal chat, fallback, text, voice, photo, docs, and direct-file media keep working without user-token enrichment.
 
-For your own install, create a VK app and keep its protected key on the Hermes host. The helper accepts either CLI flags or environment variables:
+For your own install, create a VK app and keep its protected key on the Hermes host. App settings are only needed when creating or refreshing the optional user token; the running gateway auto-loads the stored token from `~/.hermes/secrets/vk_gateway_user_token` when it exists and metadata says it is not near expiry. The helper accepts either CLI flags or environment variables:
 
 ```dotenv
 # VK app id used only for the gateway OAuth code exchange.

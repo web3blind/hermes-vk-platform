@@ -48,6 +48,9 @@ DEFAULT_DEDUPE_TTL_SECONDS = 30 * 60
 VK_TRANSIENT_RETRY_DELAY_SECONDS = 5.0
 VALID_ACCESS_POLICIES = {"any", "user_only", "peer_only", "peer_and_user"}
 DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "application/octet-stream")
+VK_GATEWAY_USER_TOKEN_SECRET_NAME = "vk_gateway_user_token"
+VK_GATEWAY_USER_TOKEN_META_NAME = "vk_gateway_user_token_meta.json"
+VK_GATEWAY_USER_TOKEN_MIN_SECONDS_LEFT = 3600
 
 # VK message reactions are identified by community-scoped numeric ids, not
 # emoji. Common default set (per nanobot-channel-vk's README):
@@ -799,6 +802,39 @@ def _looks_like_downloadable_attachment_url(url: str) -> bool:
     return True
 
 
+def _load_gateway_user_token_from_store(*, min_seconds_left: int = VK_GATEWAY_USER_TOKEN_MIN_SECONDS_LEFT) -> tuple[str, str]:
+    """Load helper-managed gateway user token if present and not near expiry.
+
+    The OAuth helper performs interactive/code-exchange storage. The running
+    gateway should not require operators to copy tokens into .env manually, so
+    the adapter auto-loads the helper's token file. This check is intentionally
+    local/metadata-only: if VK revokes a token early, video.get will fail safely
+    and the helper's token-status command will report the live failure.
+    """
+    try:
+        secrets_dir = get_hermes_home() / "secrets"
+        token_path = secrets_dir / VK_GATEWAY_USER_TOKEN_SECRET_NAME
+        meta_path = secrets_dir / VK_GATEWAY_USER_TOKEN_META_NAME
+        if not token_path.exists():
+            return "", "missing"
+        token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            return "", "empty"
+        if not meta_path.exists():
+            return "", "missing_metadata"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        expires_at = int(meta.get("expires_at") or 0)
+        if not expires_at:
+            return "", "missing_expiry"
+        seconds_left = expires_at - int(time.time())
+        if seconds_left < max(0, int(min_seconds_left)):
+            return "", "expired_or_near_expiry"
+        return token, "store"
+    except Exception as exc:
+        logger.debug("VK: gateway user token store unavailable — %s", _redact_token(str(exc)))
+        return "", "store_error"
+
+
 def _markdown_to_vk_plain_text(content: str) -> str:
     """Convert common Markdown into readable VK plain text.
 
@@ -858,7 +894,16 @@ class VKAdapter(BasePlatformAdapter):
         # community tokens (notably ``video.get``). It must be explicitly
         # configured for the gateway plugin; do not borrow tokens from separate
         # publishing/uploading workflows.
-        self.user_token = os.getenv("VK_USER_TOKEN") or extra.get("user_token", "")
+        explicit_user_token = os.getenv("VK_USER_TOKEN") or extra.get("user_token", "")
+        stored_user_token = ""
+        self._user_token_source = "none"
+        if explicit_user_token:
+            self.user_token = explicit_user_token
+            self._user_token_source = "explicit"
+        else:
+            stored_user_token, store_reason = _load_gateway_user_token_from_store()
+            self.user_token = stored_user_token
+            self._user_token_source = store_reason if stored_user_token else f"store:{store_reason}"
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
 
@@ -976,6 +1021,10 @@ class VKAdapter(BasePlatformAdapter):
             return False
 
         self._poll_task = asyncio.create_task(self._poll_loop(), name="vk-longpoll")
+        if self.user_token:
+            logger.info("VK: gateway user token media enrichment enabled source=%s", self._user_token_source)
+        else:
+            logger.info("VK: gateway user token media enrichment disabled reason=%s", self._user_token_source)
         if self.fallback_poll_enabled:
             self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
         self._mark_connected()

@@ -661,6 +661,7 @@ async def test_project_lane_active_selection_routes_message_as_thread(monkeypatc
         }
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "lane:tccc-ai"
@@ -668,6 +669,83 @@ async def test_project_lane_active_selection_routes_message_as_thread(monkeypatc
     assert event.auto_skill == ["tccc-ai-product-development", "coding"]
     assert "audit context" in event.channel_prompt
     assert build_session_key(event.source) == "agent:main:vk:thread:2000000042:lane:tccc-ai"
+
+
+@pytest.mark.asyncio
+async def test_new_session_button_routes_new_inside_active_project_lane(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={
+                "group_id": "123456789",
+                "allowed_peers": ["2000000042"],
+                "project_lanes": {
+                    "2000000042": {
+                        "lanes": [{"id": "tccc-ai", "name": "TCCC AI", "description": "audit context"}]
+                    }
+                },
+            },
+        )
+    )
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+    await adapter._set_active_lane_id("2000000042", "100", "tccc-ai")
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 15,
+                    "text": "Новая сессия",
+                    "payload": json.dumps({"vkpl": "new_session"}),
+                }
+            },
+        }
+    )
+
+    assert adapter.handle_message.await_args is not None
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/new"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "lane:tccc-ai"
+    assert build_session_key(event.source) == "agent:main:vk:thread:2000000042:lane:tccc-ai"
+
+
+@pytest.mark.asyncio
+async def test_new_session_button_routes_new_to_root_when_no_project_is_active(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_peers": ["2000000042"]})
+    )
+    adapter._vk_method = AsyncMock(return_value={"response": {"items": []}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": 100,
+                    "peer_id": 2000000042,
+                    "conversation_message_id": 16,
+                    "text": "Новая сессия",
+                    "payload": json.dumps({"vkpl": "new_session"}),
+                }
+            },
+        }
+    )
+
+    assert adapter.handle_message.await_args is not None
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/new"
+    assert event.source.chat_type == "group"
+    assert event.source.thread_id is None
+    assert build_session_key(event.source) == "agent:main:vk:group:2000000042:100"
 
 
 @pytest.mark.asyncio
@@ -698,6 +776,7 @@ async def test_project_alias_one_shot_routes_without_changing_active_lane(monkey
         }
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "задача"
     assert event.source.thread_id == "lane:tccc-ai"
@@ -747,6 +826,7 @@ async def test_vk_button_text_mentions_are_stripped_before_gateway_message(monke
         }
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "3"
     assert event.source.thread_id == "lane:hermes-vk-plugin"
@@ -1330,6 +1410,7 @@ async def test_project_new_pending_routes_unparseable_text_to_normal_agent_turn(
         {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 14, "text": "создай новый проект"}}}
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert "VK project lane creation mode" in event.channel_prompt
     assert event.text.startswith("создай новый проект")
@@ -1483,6 +1564,7 @@ async def test_project_edit_pending_unparseable_text_routes_to_normal_agent_turn
         {"type": "message_new", "object": {"message": {"from_id": 100, "peer_id": 2000000042, "conversation_message_id": 20, "text": "сделай так, чтобы модель сама поняла нужные изменения"}}}
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert "VK project lane edit mode" in event.channel_prompt
     assert "Project to edit: gito" in event.channel_prompt
@@ -1957,6 +2039,7 @@ async def test_vk_reply_to_clarify_prompt_restores_lane_for_text_fallback(monkey
         }
     )
 
+    assert adapter.handle_message.await_args is not None
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "2"
     assert event.source.chat_type == "thread"
@@ -3068,7 +3151,7 @@ async def test_vk_send_attaches_project_keyboard_for_allowed_chat_without_lanes(
     assert result.success is True
     send_params = [params for method, params in calls if method == "messages.send"][-1]
     labels = [button["action"].get("label") for row in json.loads(send_params["keyboard"])["buttons"] for button in row]
-    assert labels == ["Проекты", "Новый проект", "Команды"]
+    assert labels == ["Проекты", "Новый проект", "Команды", "Новая сессия"]
 
 
 @pytest.mark.asyncio
@@ -3094,7 +3177,7 @@ async def test_vk_send_attaches_project_keyboard_for_allowed_dm_without_lanes(mo
     assert result.success is True
     send_params = [params for method, params in calls if method == "messages.send"][-1]
     labels = [button["action"].get("label") for row in json.loads(send_params["keyboard"])["buttons"] for button in row]
-    assert labels == ["Проекты", "Новый проект", "Команды"]
+    assert labels == ["Проекты", "Новый проект", "Команды", "Новая сессия"]
 
 
 @pytest.mark.asyncio

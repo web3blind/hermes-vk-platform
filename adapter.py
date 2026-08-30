@@ -1513,6 +1513,7 @@ class VKAdapter(BasePlatformAdapter):
             [{"action": {"type": "text", "label": "Проекты", "payload": json.dumps({"vkpl": "list"}, ensure_ascii=False)}, "color": "secondary"}],
             [{"action": {"type": "text", "label": "Новый проект", "payload": json.dumps({"vkpl": "new"}, ensure_ascii=False)}, "color": "primary"}],
             [{"action": {"type": "text", "label": "Команды", "payload": json.dumps({"vkpl": "commands"}, ensure_ascii=False)}, "color": "secondary"}],
+            [{"action": {"type": "text", "label": "Новая сессия", "payload": json.dumps({"vkpl": "new_session"}, ensure_ascii=False)}, "color": "secondary"}],
         ]
         return json.dumps({"one_time": False, "inline": False, "buttons": buttons}, ensure_ascii=False)
 
@@ -1659,6 +1660,7 @@ class VKAdapter(BasePlatformAdapter):
                 "/project pin — закрепить текущий проект первым в списке",
                 "/project unpin — открепить текущий проект",
                 "/project off — выйти из проектного режима",
+                "/new — новая сессия текущего проекта; если проект не выбран, новая сессия всего VK-чата",
                 "/invite — актуальный инвайт в текущий VK-чат",
                 "Кнопки ниже кликабельные: нажми команду, и VK отправит её в чат.",
             ]
@@ -2477,6 +2479,9 @@ class VKAdapter(BasePlatformAdapter):
             if button_payload.get("vkpl") == "commands":
                 await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
                 return
+            if button_payload.get("vkpl") == "new_session":
+                text = "/new"
+                control_text = "/new"
             if button_payload.get("vkpl") == "cmd":
                 command = str(button_payload.get("cmd") or "").strip()
                 if command == "/invite":

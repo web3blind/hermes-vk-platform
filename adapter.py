@@ -2192,7 +2192,10 @@ class VKAdapter(BasePlatformAdapter):
                     "ts": self._lp_ts,
                     "wait": 25,
                 }
-                data = await _http_json_async(self._lp_server, params, timeout=40)
+                data = await asyncio.wait_for(
+                    _http_json_async(self._lp_server, params, timeout=40),
+                    timeout=50,
+                )
 
                 if "failed" in data:
                     failed = int(data.get("failed") or 0)
@@ -3547,6 +3550,11 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
         value = vk_cfg.get(key)
         if value is not None:
             extra[key] = value
+    if isinstance(platforms_vk_extra, dict):
+        for key in ("reactions_enabled", "reaction_progress", "reaction_ok", "reaction_fail"):
+            if key in platforms_vk_extra:
+                extra[key] = platforms_vk_extra[key]
+
     canonical_project_lanes = platforms_vk_extra.get("project_lanes") if isinstance(platforms_vk_extra, dict) else None
     if canonical_project_lanes is not None:
         extra["project_lanes"] = _normalize_project_lanes(_extract_project_lanes_config(canonical_project_lanes))

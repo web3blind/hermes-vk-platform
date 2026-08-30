@@ -292,6 +292,30 @@ def test_yaml_config_bridges_vk_channel_prompts_and_skill_bindings():
     }
 
 
+def test_vk_apply_yaml_config_preserves_canonical_reaction_settings(monkeypatch):
+    extra = _apply_yaml_config(
+        {
+            "platforms": {
+                "vk": {
+                    "extra": {
+                        "reactions_enabled": True,
+                        "reaction_progress": 10,
+                        "reaction_ok": 4,
+                        "reaction_fail": 0,
+                    }
+                }
+            }
+        },
+        SimpleNamespace(token=None),
+    )
+
+    assert extra is not None
+    assert extra["reactions_enabled"] is True
+    assert extra["reaction_progress"] == 10
+    assert extra["reaction_ok"] == 4
+    assert extra["reaction_fail"] == 0
+
+
 def test_project_lanes_config_is_normalized_and_bridged(monkeypatch):
     platform_cfg = SimpleNamespace(token=None)
 

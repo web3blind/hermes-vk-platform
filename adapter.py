@@ -918,6 +918,7 @@ class VKAdapter(BasePlatformAdapter):
         self._lp_server = ""
         self._lp_key = ""
         self._lp_ts = ""
+        self._lp_no_update_cycles = 0
         self._lock_key: Optional[str] = None
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
         self._seen_message_keys: dict[str, float] = {}
@@ -2197,6 +2198,17 @@ class VKAdapter(BasePlatformAdapter):
         self._lp_ts = str(response.get("ts") or "")
         if not self._lp_server or not self._lp_key or not self._lp_ts:
             raise RuntimeError("VK long poll server response is missing server/key/ts")
+        try:
+            lp_host = urllib.parse.urlparse(self._lp_server).netloc or "unknown"
+        except Exception:
+            lp_host = "unknown"
+        logger.info(
+            "VK: long poll server refreshed group=%s host=%s ts=%s api_version=%s",
+            self.group_id,
+            lp_host,
+            self._lp_ts,
+            self.api_version,
+        )
 
     async def _poll_loop(self) -> None:
         backoff = 1.0
@@ -2221,8 +2233,28 @@ class VKAdapter(BasePlatformAdapter):
                         await self._refresh_longpoll_server()
                     continue
 
+                previous_ts = self._lp_ts
                 self._lp_ts = str(data.get("ts") or self._lp_ts)
-                for update in data.get("updates") or []:
+                updates = data.get("updates") or []
+                if updates:
+                    self._lp_no_update_cycles = 0
+                    logger.info(
+                        "VK: long poll returned %d update(s) ts=%s->%s types=%s",
+                        len(updates),
+                        previous_ts,
+                        self._lp_ts,
+                        ",".join(str(update.get("type") or "") for update in updates[:10]),
+                    )
+                else:
+                    self._lp_no_update_cycles += 1
+                    if self._lp_no_update_cycles in {1, 3, 12} or self._lp_no_update_cycles % 24 == 0:
+                        logger.info(
+                            "VK: long poll no updates streak=%d ts=%s->%s",
+                            self._lp_no_update_cycles,
+                            previous_ts,
+                            self._lp_ts,
+                        )
+                for update in updates:
                     await self._handle_update(update)
                 backoff = 1.0
             except asyncio.CancelledError:
@@ -2287,7 +2319,14 @@ class VKAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("VK: fallback bootstrap failed peer=%s — %s", peer_id, _redact_token(str(exc)))
         if self._fallback_last_cmid:
-            logger.info("VK: fallback cmid poll bootstrapped for %d peer(s)", len(self._fallback_last_cmid))
+            sample = ", ".join(
+                f"{peer}:{cmid}" for peer, cmid in sorted(self._fallback_last_cmid.items())[:20]
+            )
+            logger.info(
+                "VK: fallback cmid poll bootstrapped for %d peer(s): %s",
+                len(self._fallback_last_cmid),
+                sample,
+            )
 
     async def _fallback_poll_once(self) -> int:
         await self._bootstrap_fallback_poll()
@@ -2305,6 +2344,18 @@ class VKAdapter(BasePlatformAdapter):
                 continue
             max_seen = max(int(item.get("conversation_message_id") or 0) for item in items)
             self._fallback_last_cmid[peer_id] = max(last, max_seen)
+            user_items = [
+                item for item in items if str(item.get("from_id") or "") and not str(item.get("from_id") or "").startswith("-")
+            ]
+            if user_items:
+                logger.info(
+                    "VK: fallback cmid poll found %d user message(s) peer=%s cmid=%s..%s previous=%s",
+                    len(user_items),
+                    peer_id,
+                    min(int(item.get("conversation_message_id") or 0) for item in user_items),
+                    max(int(item.get("conversation_message_id") or 0) for item in user_items),
+                    last,
+                )
             for item in sorted(items, key=lambda msg: int(msg.get("conversation_message_id") or 0)):
                 from_id = str(item.get("from_id") or "")
                 if not from_id or from_id.startswith("-"):

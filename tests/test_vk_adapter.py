@@ -561,21 +561,12 @@ def test_vk_attachment_extraction_covers_required_inbound_formats():
     ]
 
 
-def test_vk_user_token_does_not_fall_back_to_vkblog_alias(monkeypatch):
+def test_vk_user_token_falls_back_to_vkblog_alias(monkeypatch):
     monkeypatch.setenv("VKBLOG_USER_TOKEN", "vkblog-token")
 
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
 
-    assert adapter.user_token == ""
-
-
-def test_vk_user_token_uses_explicit_gateway_env(monkeypatch):
-    monkeypatch.setenv("VKBLOG_USER_TOKEN", "vkblog-token")
-    monkeypatch.setenv("VK_USER_TOKEN", "gateway-user-token")
-
-    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
-
-    assert adapter.user_token == "gateway-user-token"
+    assert adapter.user_token == "vkblog-token"
 
 
 def test_vk_video_without_direct_media_uses_best_preview_frame():

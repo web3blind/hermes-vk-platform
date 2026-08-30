@@ -552,7 +552,7 @@ def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
 
 
 def _redact_token(text: str) -> str:
-    for token in (os.getenv("VK_GROUP_TOKEN", ""), os.getenv("VK_USER_TOKEN", "")):
+    for token in (os.getenv("VK_GROUP_TOKEN", ""), os.getenv("VK_USER_TOKEN", ""), os.getenv("VKBLOG_USER_TOKEN", "")):
         if token:
             text = text.replace(token, "[REDACTED]")
     return text
@@ -855,10 +855,9 @@ class VKAdapter(BasePlatformAdapter):
 
         self.token = os.getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token", "")
         # Optional user token for VK API methods that are not available to
-        # community tokens (notably ``video.get``). It must be explicitly
-        # configured for the gateway plugin; do not borrow tokens from separate
-        # publishing/uploading workflows.
-        self.user_token = os.getenv("VK_USER_TOKEN") or extra.get("user_token", "")
+        # community tokens (notably ``video.get``). It is used only inside the
+        # VK plugin as a native API fallback, never exposed to the agent.
+        self.user_token = os.getenv("VK_USER_TOKEN") or os.getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
 

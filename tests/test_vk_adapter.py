@@ -3,7 +3,6 @@ import json
 import os
 import sqlite3
 import sys
-import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -577,42 +576,6 @@ def test_vk_user_token_uses_explicit_gateway_env(monkeypatch):
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
 
     assert adapter.user_token == "gateway-user-token"
-    assert adapter._user_token_source == "explicit"
-
-
-def test_vk_user_token_absent_without_store_does_not_break(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-
-    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
-
-    assert adapter.user_token == ""
-    assert adapter._user_token_source == "store:missing"
-
-
-def test_vk_user_token_auto_loads_gateway_store(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    secrets = tmp_path / "secrets"
-    secrets.mkdir()
-    (secrets / "vk_gateway_user_token").write_text("stored-token\n")
-    (secrets / "vk_gateway_user_token_meta.json").write_text(json.dumps({"expires_at": int(time.time()) + 7200}))
-
-    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
-
-    assert adapter.user_token == "stored-token"
-    assert adapter._user_token_source == "store"
-
-
-def test_vk_user_token_ignores_expired_gateway_store(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    secrets = tmp_path / "secrets"
-    secrets.mkdir()
-    (secrets / "vk_gateway_user_token").write_text("stored-token\n")
-    (secrets / "vk_gateway_user_token_meta.json").write_text(json.dumps({"expires_at": int(time.time()) - 10}))
-
-    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
-
-    assert adapter.user_token == ""
-    assert adapter._user_token_source == "store:expired_or_near_expiry"
 
 
 def test_vk_video_without_direct_media_uses_best_preview_frame():

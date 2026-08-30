@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import os
@@ -613,6 +614,70 @@ def test_vk_user_token_ignores_expired_gateway_store(monkeypatch, tmp_path):
 
     assert adapter.user_token == ""
     assert adapter._user_token_source == "store:expired_or_near_expiry"
+
+
+@pytest.mark.asyncio
+async def test_vk_user_token_refresh_browser_reloads_store_after_helper_success(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    helper_dir = tmp_path / "plugin" / "scripts"
+    helper_dir.mkdir(parents=True)
+    helper = helper_dir / "vk_gateway_user_token.py"
+    helper.write_text("# helper exists\n")
+    fake_adapter_path = tmp_path / "plugin" / "adapter.py"
+    fake_adapter_path.write_text("# adapter\n")
+    monkeypatch.setattr("plugins.platforms.vk.adapter.Path.resolve", lambda self: fake_adapter_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(exist_ok=True)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            (secrets / "vk_gateway_user_token").write_text("fresh-token\n")
+            (secrets / "vk_gateway_user_token_meta.json").write_text(json.dumps({"expires_at": int(time.time()) + 7200}))
+            return b'{"exchange_ok": true, "token_printed": false}', b''
+
+    async def fake_create(*args, **kwargs):
+        assert "refresh-browser" in args
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
+
+    await adapter._refresh_gateway_user_token_from_browser()
+
+    assert adapter.user_token == "fresh-token"
+    assert adapter._user_token_source == "store"
+
+
+@pytest.mark.asyncio
+async def test_vk_user_token_refresh_browser_failure_keeps_gateway_degraded(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    helper_dir = tmp_path / "plugin" / "scripts"
+    helper_dir.mkdir(parents=True)
+    helper = helper_dir / "vk_gateway_user_token.py"
+    helper.write_text("# helper exists\n")
+    fake_adapter_path = tmp_path / "plugin" / "adapter.py"
+    fake_adapter_path.write_text("# adapter\n")
+    monkeypatch.setattr("plugins.platforms.vk.adapter.Path.resolve", lambda self: fake_adapter_path)
+
+    class FakeProc:
+        returncode = 5
+
+        async def communicate(self):
+            return b'{"ok": false, "needs_human_auth": true, "error": "oauth_code_not_obtained", "token_printed": false}', b''
+
+    async def fake_create(*args, **kwargs):
+        assert "refresh-browser" in args
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
+
+    await adapter._refresh_gateway_user_token_from_browser()
+
+    assert adapter.user_token == ""
+    assert adapter._user_token_source == "store:missing"
 
 
 def test_vk_video_without_direct_media_uses_best_preview_frame():

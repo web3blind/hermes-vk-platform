@@ -19,6 +19,7 @@ import os
 import random
 import re
 import sqlite3
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -51,6 +52,7 @@ DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "
 VK_GATEWAY_USER_TOKEN_SECRET_NAME = "vk_gateway_user_token"
 VK_GATEWAY_USER_TOKEN_META_NAME = "vk_gateway_user_token_meta.json"
 VK_GATEWAY_USER_TOKEN_MIN_SECONDS_LEFT = 3600
+VK_GATEWAY_USER_TOKEN_AUTO_REFRESH_ENV = "VK_GATEWAY_USER_TOKEN_AUTO_REFRESH"
 
 # VK message reactions are identified by community-scoped numeric ids, not
 # emoji. Common default set (per nanobot-channel-vk's README):
@@ -904,6 +906,9 @@ class VKAdapter(BasePlatformAdapter):
             stored_user_token, store_reason = _load_gateway_user_token_from_store()
             self.user_token = stored_user_token
             self._user_token_source = store_reason if stored_user_token else f"store:{store_reason}"
+        auto_refresh_value = os.getenv(VK_GATEWAY_USER_TOKEN_AUTO_REFRESH_ENV, extra.get("user_token_auto_refresh", "true"))
+        self.user_token_auto_refresh = _truthy(auto_refresh_value) or str(auto_refresh_value).strip().lower() == "true"
+        self._user_token_refresh_task: asyncio.Task | None = None
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
 
@@ -1025,14 +1030,60 @@ class VKAdapter(BasePlatformAdapter):
             logger.info("VK: gateway user token media enrichment enabled source=%s", self._user_token_source)
         else:
             logger.info("VK: gateway user token media enrichment disabled reason=%s", self._user_token_source)
+            if self.user_token_auto_refresh:
+                self._user_token_refresh_task = asyncio.create_task(
+                    self._refresh_gateway_user_token_from_browser(),
+                    name="vk-user-token-refresh",
+                )
         if self.fallback_poll_enabled:
             self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
         self._mark_connected()
         logger.info("VK: connected to group %s via long poll", self.group_id)
         return True
 
+    async def _refresh_gateway_user_token_from_browser(self) -> None:
+        """Best-effort non-blocking refresh of the helper-managed gateway user token."""
+        script = Path(__file__).resolve().parent / "scripts" / "vk_gateway_user_token.py"
+        if not script.exists():
+            logger.info("VK: gateway user token refresh skipped reason=missing_helper")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script),
+                "refresh-browser",
+                "--wait-seconds",
+                "60",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            raw = (stdout or b"").decode("utf-8", "ignore")
+            err = (stderr or b"").decode("utf-8", "ignore")[:300]
+            data: dict[str, Any] = {}
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                data = {}
+            if proc.returncode == 0 and (data.get("exchange_ok") or data.get("ok")):
+                token, source = _load_gateway_user_token_from_store()
+                if token:
+                    self.user_token = token
+                    self._user_token_source = source
+                    logger.info("VK: gateway user token refreshed and enabled source=%s", source)
+                    return
+            safe_error = str(data.get("error") or data.get("response") or err or f"exit_{proc.returncode}")[:300]
+            if data.get("needs_human_auth"):
+                logger.warning("VK: gateway user token browser refresh needs human auth reason=%s", _redact_token(safe_error))
+            else:
+                logger.info("VK: gateway user token browser refresh skipped reason=%s", _redact_token(safe_error))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("VK: gateway user token browser refresh failed reason=%s", _redact_token(str(exc)))
+
     async def disconnect(self) -> None:
-        for task in (self._poll_task, self._fallback_poll_task):
+        for task in (self._poll_task, self._fallback_poll_task, self._user_token_refresh_task):
             if task and not task.done():
                 task.cancel()
                 try:

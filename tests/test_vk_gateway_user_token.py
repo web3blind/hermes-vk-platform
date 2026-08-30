@@ -2,10 +2,19 @@ import json
 import os
 import subprocess
 import sys
+import importlib.util
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "vk_gateway_user_token.py"
+
+
+def load_helper_module():
+    spec = importlib.util.spec_from_file_location("vk_gateway_user_token", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_helper(args, *, env=None):
@@ -75,3 +84,25 @@ def test_token_status_uses_metadata_refresh_app(tmp_path):
     assert "scope=16" in data["auth_url"]
     assert "redirect_uri=https%3A%2F%2Fexample.invalid%2Fcallback" in data["auth_url"]
     assert data["token_printed"] is False
+
+
+def test_refresh_browser_missing_secret_is_safe_json(tmp_path):
+    rc, stdout, stderr = run_helper(
+        ["refresh-browser", "--client-id", "424242", "--wait-seconds", "0.1"],
+        env={"HERMES_HOME": str(tmp_path)},
+    )
+
+    assert rc == 2, stderr
+    data = json.loads(stdout)
+    assert data["ok"] is False
+    assert data["refreshed"] is False
+    assert data["error"] == "missing_client_secret"
+    assert data["path"].endswith("vk_app_424242_client_secret")
+    assert data["token_printed"] is False
+
+
+def test_extract_oauth_code_from_query_or_fragment():
+    helper = load_helper_module()
+
+    assert helper._extract_oauth_code("https://oauth.vk.com/blank.html?code=abc") == ("abc", "")
+    assert helper._extract_oauth_code("https://oauth.vk.com/blank.html#error=access_denied") == ("", "access_denied")

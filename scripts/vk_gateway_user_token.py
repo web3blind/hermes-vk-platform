@@ -22,6 +22,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+DEFAULT_CAMOFOX_URL = "http://127.0.0.1:9377"
+DEFAULT_CAMOFOX_USER_ID = "hermes_1674ee0144"
+ENV_CAMOFOX_URL_NAME = "VK_GATEWAY_CAMOFOX_URL"
+ENV_CAMOFOX_USER_ID_NAME = "VK_GATEWAY_CAMOFOX_USER_ID"
+
 DEFAULT_CLIENT_ID = "54526246"  # Local/default app; other installs should pass their own app id.
 DEFAULT_REDIRECT_URI = "https://oauth.vk.com/blank.html"
 DEFAULT_SCOPE = "8212"  # photos + video + wall; enough for video.get/media probes.
@@ -88,6 +93,44 @@ def _default_scope() -> str:
 
 def _default_client_secret_file() -> str | None:
     return os.environ.get(ENV_CLIENT_SECRET_FILE_NAME, "").strip() or None
+
+
+def _camofox_url() -> str:
+    return os.environ.get(ENV_CAMOFOX_URL_NAME, "").strip().rstrip("/") or DEFAULT_CAMOFOX_URL
+
+
+def _camofox_user_id() -> str:
+    return os.environ.get(ENV_CAMOFOX_USER_ID_NAME, "").strip() or DEFAULT_CAMOFOX_USER_ID
+
+
+def _http_json(method: str, url: str, *, body: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
+    data = None
+    headers = {"User-Agent": "hermes-vk-gateway-token/1.0"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    api_key = os.environ.get("CAMOFOX_API_KEY", "").strip()
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as exc:
+        payload = exc.read().decode("utf-8", "ignore")[:300]
+        return {"ok": False, "error": "http_error", "status": exc.code, "message": payload}
+    except Exception as exc:
+        return {"ok": False, "error": "request_failed", "message": str(exc)[:300]}
+
+
+def _extract_oauth_code(url: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlparse(url)
+    parts = {}
+    parts.update(urllib.parse.parse_qs(parsed.query))
+    parts.update(urllib.parse.parse_qs(parsed.fragment))
+    code = (parts.get("code") or [""])[0]
+    error = (parts.get("error") or [""])[0]
+    return code, error
 
 
 def client_secret_path(home: Path, client_id: str, explicit: str | None = None) -> Path:
@@ -279,6 +322,83 @@ def command_token_status(args: argparse.Namespace) -> int:
     return 0 if not needs_refresh else 1
 
 
+def command_refresh_browser(args: argparse.Namespace) -> int:
+    """Try to refresh the gateway user token through an already logged-in Camofox session."""
+    home = hermes_home()
+    client_id = args.client_id or _default_client_id()
+    redirect_uri = args.redirect_uri or _default_redirect_uri()
+    scope = args.scope or _default_scope()
+    secret_path = client_secret_path(home, client_id, args.client_secret_path or _default_client_secret_file())
+    if not secret_path.exists():
+        print(_json({"ok": False, "refreshed": False, "needs_human_auth": False, "error": "missing_client_secret", "path": str(secret_path), "token_printed": False}))
+        return 2
+
+    auth_url = "https://oauth.vk.com/authorize?" + urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "display": "page",
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "response_type": "code",
+            "v": DEFAULT_API_VERSION,
+        }
+    )
+    base = (args.camofox_url or _camofox_url()).rstrip("/")
+    user_id = args.camofox_user_id or _camofox_user_id()
+    opened = _http_json(
+        "POST",
+        f"{base}/tabs/open",
+        body={"url": auth_url, "userId": user_id, "listItemId": "vk-gateway-oauth-refresh"},
+        timeout=args.open_timeout,
+    )
+    if not opened.get("ok"):
+        print(_json({"ok": False, "refreshed": False, "needs_human_auth": False, "error": "browser_open_failed", "browser": opened, "token_printed": False}))
+        return 3
+
+    tab_id = str(opened.get("tabId") or opened.get("targetId") or "")
+    observed_url = str(opened.get("url") or "")
+    deadline = time.time() + args.wait_seconds
+    code = ""
+    error = ""
+    while time.time() < deadline:
+        code, error = _extract_oauth_code(observed_url)
+        if code or error:
+            break
+        tabs = _http_json("GET", f"{base}/tabs?" + urllib.parse.urlencode({"userId": user_id}), timeout=5)
+        for tab in tabs.get("tabs") or []:
+            if tab_id and str(tab.get("tabId") or tab.get("targetId") or "") == tab_id:
+                observed_url = str(tab.get("url") or observed_url)
+                break
+            if str(tab.get("listItemId") or "") == "vk-gateway-oauth-refresh":
+                observed_url = str(tab.get("url") or observed_url)
+                tab_id = str(tab.get("tabId") or tab.get("targetId") or tab_id)
+                break
+        time.sleep(args.poll_interval)
+
+    if error:
+        print(_json({"ok": False, "refreshed": False, "needs_human_auth": True, "error": "oauth_error", "oauth_error": error, "final_host": urllib.parse.urlparse(observed_url).netloc, "token_printed": False}))
+        return 4
+    if not code:
+        snapshot = _http_json("GET", f"{base}/snapshot?" + urllib.parse.urlencode({"targetId": tab_id, "userId": user_id, "format": "aria"}), timeout=5) if tab_id else {}
+        text = str(snapshot.get("snapshot") or "").lower()
+        needs_login = any(marker in text for marker in ("вход", "log in", "login", "пароль", "password", "captcha", "подтверд"))
+        print(_json({"ok": False, "refreshed": False, "needs_human_auth": True, "error": "oauth_code_not_obtained", "browser_url_host": urllib.parse.urlparse(observed_url).netloc, "browser_url_path": urllib.parse.urlparse(observed_url).path, "login_or_challenge_likely": needs_login, "token_printed": False}))
+        return 5
+
+    exchange_args = argparse.Namespace(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scope=scope,
+        scope_note=args.scope_note,
+        client_secret_path=str(secret_path),
+        code=code,
+        no_store=False,
+    )
+    rc = command_exchange_code(exchange_args)
+    return rc
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage explicit VK_USER_TOKEN for Hermes VK gateway media enrichment")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -305,6 +425,19 @@ def main() -> int:
     p_status.add_argument("--client-id", default=None, help=f"VK app id; default env {ENV_APP_ID_NAME} or local default")
     p_status.add_argument("--redirect-uri", default=None, help=f"OAuth redirect URI; default env {ENV_REDIRECT_URI_NAME} or blank.html")
     p_status.set_defaults(func=command_token_status)
+
+    p_browser = sub.add_parser("refresh-browser")
+    p_browser.add_argument("--scope", default=None, help=f"OAuth scope; default env {ENV_SCOPE_NAME} or {DEFAULT_SCOPE}")
+    p_browser.add_argument("--scope-note", default="photos+video+wall, no offline; gateway browser refresh")
+    p_browser.add_argument("--client-id", default=None, help=f"VK app id; default env {ENV_APP_ID_NAME} or local default")
+    p_browser.add_argument("--redirect-uri", default=None, help=f"OAuth redirect URI; default env {ENV_REDIRECT_URI_NAME} or blank.html")
+    p_browser.add_argument("--client-secret-path", default=None, help=f"Protected key path; default env {ENV_CLIENT_SECRET_FILE_NAME} or ~/.hermes/secrets/vk_app_<client_id>_client_secret")
+    p_browser.add_argument("--camofox-url", default=None, help=f"Camofox REST URL; default env {ENV_CAMOFOX_URL_NAME} or {DEFAULT_CAMOFOX_URL}")
+    p_browser.add_argument("--camofox-user-id", default=None, help=f"Camofox user id; default env {ENV_CAMOFOX_USER_ID_NAME} or {DEFAULT_CAMOFOX_USER_ID}")
+    p_browser.add_argument("--wait-seconds", type=float, default=45.0)
+    p_browser.add_argument("--poll-interval", type=float, default=1.0)
+    p_browser.add_argument("--open-timeout", type=float, default=30.0)
+    p_browser.set_defaults(func=command_refresh_browser)
 
     args = parser.parse_args()
     return int(args.func(args))

@@ -182,7 +182,7 @@ VK_USER_TOKEN=
 
 Gateway user tokens are short-lived unless VK grants offline access. They are optional and only improve media enrichment for attachments where the community token cannot expose a direct file URL. If no gateway app/user token is configured, the gateway does not fail: normal chat, fallback, text, voice, photo, docs, and direct-file media keep working without user-token enrichment.
 
-For your own install, create a VK app and keep its protected key on the Hermes host. App settings are only needed when creating or refreshing the optional user token; the running gateway auto-loads the stored token from `~/.hermes/secrets/vk_gateway_user_token` when it exists and metadata says it is not near expiry. The helper accepts either CLI flags or environment variables:
+For your own install, create a VK app and keep its protected key on the Hermes host. App settings are only needed when creating or refreshing the optional user token; the running gateway auto-loads the stored token from `~/.hermes/secrets/vk_gateway_user_token` when it exists and metadata says it is not near expiry. When `VK_GATEWAY_USER_TOKEN_AUTO_REFRESH` is unset or true, the gateway also starts a non-blocking browser refresh attempt on startup if the stored token is missing or expired; if Camofox/VK is not logged in, it logs a safe `needs_human_auth`/degraded status and keeps processing messages. The helper accepts either CLI flags or environment variables:
 
 ```dotenv
 # VK app id used only for the gateway OAuth code exchange.
@@ -196,6 +196,13 @@ VK_GATEWAY_SCOPE=8212
 
 # Optional; otherwise ~/.hermes/secrets/vk_app_<VK_GATEWAY_APP_ID>_client_secret.
 VK_GATEWAY_CLIENT_SECRET_FILE=/absolute/path/to/protected_key
+
+# Set to 0/false to disable gateway-started browser refresh attempts.
+VK_GATEWAY_USER_TOKEN_AUTO_REFRESH=true
+
+# Camofox rail used by refresh-browser when browser auth is available.
+VK_GATEWAY_CAMOFOX_URL=http://127.0.0.1:9377
+VK_GATEWAY_CAMOFOX_USER_ID=hermes_1674ee0144
 ```
 
 Manage the token with:
@@ -207,6 +214,10 @@ python3 scripts/vk_gateway_user_token.py auth-url --scope 8212
 # Exchange the OAuth code, store ~/.hermes/secrets/vk_gateway_user_token,
 # update ~/.hermes/.env as VK_USER_TOKEN, and live-validate with users.get.
 python3 scripts/vk_gateway_user_token.py exchange-code --code '<code_from_oauth_blank_page>'
+
+# Or let the helper use the configured Camofox browser session; this is what
+# the gateway starts in the background when auto-refresh is enabled.
+python3 scripts/vk_gateway_user_token.py refresh-browser
 
 # Before relying on video.get/media enrichment, validate freshness.
 python3 scripts/vk_gateway_user_token.py token-status

@@ -3156,7 +3156,11 @@ class VKAdapter(BasePlatformAdapter):
                     value = str(files.get(key) or "")
                     if value:
                         return value
-            return VKAdapter._video_image_url(payload)
+            # VK message-scoped videos/video messages often expose only player/preview URLs.
+            # Preview URLs can be short-lived and may 404 by the time the gateway tries
+            # to materialize them. Do not turn an unavailable video into a native image
+            # attachment; keep the textual attachment summary instead.
+            return ""
         if kind == "audio_message":
             return str(payload.get("link_ogg") or payload.get("link_mp3") or "")
         if kind == "video_message":

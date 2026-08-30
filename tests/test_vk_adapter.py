@@ -563,12 +563,14 @@ def test_vk_attachment_extraction_covers_required_inbound_formats():
     ]
 
 
-def test_vk_user_token_does_not_fall_back_to_vkblog_alias(monkeypatch):
+def test_vk_user_token_does_not_fall_back_to_vkblog_alias(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
     monkeypatch.setenv("VKBLOG_USER_TOKEN", "vkblog-token")
 
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
 
     assert adapter.user_token == ""
+    assert adapter._user_token_source == "store:missing"
 
 
 def test_vk_user_token_uses_explicit_gateway_env(monkeypatch):
@@ -680,7 +682,7 @@ async def test_vk_user_token_refresh_browser_failure_keeps_gateway_degraded(monk
     assert adapter._user_token_source == "store:missing"
 
 
-def test_vk_video_without_direct_media_uses_best_preview_frame():
+def test_vk_video_without_direct_media_uses_text_summary_not_preview_media():
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={"group_id": "123456789"}))
     attachments = [
         {
@@ -701,8 +703,9 @@ def test_vk_video_without_direct_media_uses_best_preview_frame():
     message_type, urls, media_types = adapter._extract_attachment_media(attachments)  # type: ignore[attr-defined]
 
     assert message_type is MessageType.VIDEO
-    assert urls == ["https://sun9-1.userapi.com/big.jpg"]
-    assert media_types == ["image/jpeg"]
+    assert urls == []
+    assert media_types == []
+    assert adapter._summarize_attachments(attachments) == "[VK attachment: видеосообщение]"
 
 
 def test_vk_video_merge_preserves_original_preview_when_enrichment_has_no_file():
@@ -2609,7 +2612,7 @@ async def test_vk_video_get_enrichment_uses_api_ref_and_direct_files():
 
 
 @pytest.mark.asyncio
-async def test_vk_video_get_failure_preserves_original_preview():
+async def test_vk_video_get_failure_keeps_text_summary_without_preview_media():
     adapter = VKAdapter(
         PlatformConfig(enabled=True, token="group-token", extra={"group_id": "123456789", "user_token": "user-token"})
     )
@@ -2657,8 +2660,9 @@ async def test_vk_video_get_failure_preserves_original_preview():
         ("video.get", {"videos": "103_456_ak"}, "user-token"),
     ]
     assert message_type is MessageType.VIDEO
-    assert urls == ["https://sun9-1.userapi.com/live.jpg"]
-    assert media_types == ["image/jpeg"]
+    assert urls == []
+    assert media_types == []
+    assert adapter._summarize_attachments(enriched["attachments"]) == "[VK attachment: видео]"
 
 
 @pytest.mark.asyncio

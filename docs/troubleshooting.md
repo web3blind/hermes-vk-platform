@@ -67,10 +67,4 @@ In VK community settings, check:
 
 Some VK attachments expose only player/watch-page metadata. The plugin does not pretend those pages are direct files.
 
-For video metadata fallback, configure an explicit gateway `VK_USER_TOKEN`; normal text/chat use does not need it. Do not copy tokens from publishing workflows. Use the gateway lifecycle helper instead:
-
-```bash
-python3 scripts/vk_gateway_user_token.py auth-url --scope 8212
-python3 scripts/vk_gateway_user_token.py exchange-code --code '<code_from_oauth_blank_page>'
-python3 scripts/vk_gateway_user_token.py token-status
-```
+For video metadata fallback, optionally configure `VK_USER_TOKEN`, but normal text/chat use does not need it.

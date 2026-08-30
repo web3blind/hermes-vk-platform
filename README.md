@@ -174,24 +174,8 @@ VK_MAX_ATTACHMENT_BYTES=26214400
 # In-memory duplicate event TTL in seconds. Default: 1800.
 VK_DEDUPE_TTL_SECONDS=1800
 
-# Optional explicit gateway user token for video metadata fallback.
-# Do not copy tokens from publishing workflows. Use scripts/vk_gateway_user_token.py
-# to create/refresh this via server-side OAuth code exchange.
+# Optional user token for video metadata fallback. Not needed for normal chat usage.
 VK_USER_TOKEN=
-```
-
-Gateway user tokens are short-lived unless VK grants offline access. Manage them with:
-
-```bash
-# Print an OAuth URL for the user to open; the returned code is exchanged server-side.
-python3 scripts/vk_gateway_user_token.py auth-url --scope 8212
-
-# Exchange the OAuth code, store ~/.hermes/secrets/vk_gateway_user_token,
-# update ~/.hermes/.env as VK_USER_TOKEN, and live-validate with users.get.
-python3 scripts/vk_gateway_user_token.py exchange-code --code '<code_from_oauth_blank_page>'
-
-# Before relying on video.get/media enrichment, validate freshness.
-python3 scripts/vk_gateway_user_token.py token-status
 ```
 
 ### Message reactions (👌 → 👍/👎)

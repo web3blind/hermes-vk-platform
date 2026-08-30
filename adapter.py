@@ -902,7 +902,19 @@ class VKAdapter(BasePlatformAdapter):
         )
         self._delete_reaction_supported: Optional[bool] = None
 
+        self.fallback_poll_enabled = _truthy(os.getenv("VK_FALLBACK_POLL_ENABLED") or extra.get("fallback_poll_enabled") or "true")
+        self.fallback_poll_interval_seconds = _parse_positive_int(
+            os.getenv("VK_FALLBACK_POLL_INTERVAL_SECONDS") or extra.get("fallback_poll_interval_seconds"),
+            15,
+        )
+        self.fallback_poll_batch_size = _parse_positive_int(
+            os.getenv("VK_FALLBACK_POLL_BATCH_SIZE") or extra.get("fallback_poll_batch_size"),
+            25,
+        )
+
         self._poll_task: Optional[asyncio.Task] = None
+        self._fallback_poll_task: Optional[asyncio.Task] = None
+        self._fallback_last_cmid: dict[str, int] = {}
         self._lp_server = ""
         self._lp_key = ""
         self._lp_ts = ""
@@ -961,18 +973,22 @@ class VKAdapter(BasePlatformAdapter):
             return False
 
         self._poll_task = asyncio.create_task(self._poll_loop(), name="vk-longpoll")
+        if self.fallback_poll_enabled:
+            self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
         self._mark_connected()
         logger.info("VK: connected to group %s via long poll", self.group_id)
         return True
 
     async def disconnect(self) -> None:
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._poll_task, self._fallback_poll_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._poll_task = None
+        self._fallback_poll_task = None
         self._mark_disconnected()
         await self._release_lock()
 
@@ -2219,6 +2235,96 @@ class VKAdapter(BasePlatformAdapter):
                     await self._refresh_longpoll_server()
                 except Exception:
                     pass
+
+    def _fallback_peer_ids(self) -> list[str]:
+        peers = set(self.allowed_peers or set())
+        if self.home_channel:
+            peers.add(str(self.home_channel))
+        if isinstance(self.project_lanes, dict):
+            peers.update(str(peer) for peer in self.project_lanes.keys())
+        return sorted(peer for peer in peers if peer)
+
+    async def _fetch_cmid_items(self, peer_id: str, cmids: list[int]) -> list[dict[str, Any]]:
+        if not cmids:
+            return []
+        payload = await self._vk_method(
+            "messages.getByConversationMessageId",
+            {
+                "peer_id": str(peer_id),
+                "conversation_message_ids": ",".join(str(cmid) for cmid in cmids),
+            },
+        )
+        response = payload.get("response") or {}
+        items = response.get("items") if isinstance(response, dict) else []
+        return [item for item in (items or []) if isinstance(item, dict)]
+
+    async def _cmid_exists(self, peer_id: str, cmid: int) -> bool:
+        try:
+            return bool(await self._fetch_cmid_items(peer_id, [cmid]))
+        except Exception as exc:
+            logger.debug("VK: fallback cmid probe failed peer=%s cmid=%s — %s", peer_id, cmid, _redact_token(str(exc)))
+            return False
+
+    async def _discover_latest_cmid(self, peer_id: str) -> int:
+        high = 1
+        while high < 131072 and await self._cmid_exists(peer_id, high):
+            high *= 2
+        low = high // 2
+        while low + 1 < high:
+            mid = (low + high) // 2
+            if await self._cmid_exists(peer_id, mid):
+                low = mid
+            else:
+                high = mid
+        return low
+
+    async def _bootstrap_fallback_poll(self) -> None:
+        for peer_id in self._fallback_peer_ids():
+            if peer_id in self._fallback_last_cmid:
+                continue
+            try:
+                self._fallback_last_cmid[peer_id] = await self._discover_latest_cmid(peer_id)
+            except Exception as exc:
+                logger.debug("VK: fallback bootstrap failed peer=%s — %s", peer_id, _redact_token(str(exc)))
+        if self._fallback_last_cmid:
+            logger.info("VK: fallback cmid poll bootstrapped for %d peer(s)", len(self._fallback_last_cmid))
+
+    async def _fallback_poll_once(self) -> int:
+        await self._bootstrap_fallback_poll()
+        handled = 0
+        batch_size = max(1, min(int(self.fallback_poll_batch_size), 100))
+        for peer_id in self._fallback_peer_ids():
+            last = int(self._fallback_last_cmid.get(peer_id, 0))
+            ids = list(range(last + 1, last + batch_size + 1))
+            try:
+                items = await self._fetch_cmid_items(peer_id, ids)
+            except Exception as exc:
+                logger.debug("VK: fallback cmid poll failed peer=%s — %s", peer_id, _redact_token(str(exc)))
+                continue
+            if not items:
+                continue
+            max_seen = max(int(item.get("conversation_message_id") or 0) for item in items)
+            self._fallback_last_cmid[peer_id] = max(last, max_seen)
+            for item in sorted(items, key=lambda msg: int(msg.get("conversation_message_id") or 0)):
+                from_id = str(item.get("from_id") or "")
+                if not from_id or from_id.startswith("-"):
+                    continue
+                await self._handle_update({"type": "message_new", "object": {"message": item}})
+                handled += 1
+        return handled
+
+    async def _fallback_poll_loop(self) -> None:
+        while True:
+            try:
+                handled = await self._fallback_poll_once()
+                if handled:
+                    logger.info("VK: fallback cmid poll handled %d message(s)", handled)
+                await asyncio.sleep(max(5, int(self.fallback_poll_interval_seconds)))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("VK: fallback cmid poll error — %s", _redact_token(str(exc)))
+                await asyncio.sleep(30)
 
     async def _handle_update(self, update: dict[str, Any]) -> None:
         update_type = str(update.get("type") or "")

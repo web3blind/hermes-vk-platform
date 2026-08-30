@@ -392,6 +392,33 @@ def test_upsert_lane_in_config_writes_canonical_project_lanes():
 
 
 @pytest.mark.asyncio
+async def test_vk_fallback_cmid_poll_handles_new_user_messages(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(
+        PlatformConfig(enabled=True, extra={"group_id": "123456789", "allowed_peers": ["2000000009"]})
+    )
+    adapter._fallback_last_cmid["2000000009"] = 184
+    adapter._fetch_cmid_items = AsyncMock(
+        return_value=[
+            {"from_id": -123456789, "peer_id": 2000000009, "conversation_message_id": 185, "text": "bot echo"},
+            {"from_id": 103088086, "peer_id": 2000000009, "conversation_message_id": 186, "text": "user text"},
+        ]
+    )
+    adapter.handle_message = AsyncMock()
+
+    handled = await adapter._fallback_poll_once()
+
+    assert handled == 1
+    adapter.handle_message.assert_awaited_once()
+    await_args = adapter.handle_message.await_args
+    assert await_args is not None
+    event = await_args.args[0]
+    assert event.source.chat_id == "2000000009"
+    assert event.message_id == "186"
+    assert event.text == "user text"
+
+
+@pytest.mark.asyncio
 async def test_project_new_persists_lane_to_canonical_config(monkeypatch, tmp_path):
     monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
     saved = {}

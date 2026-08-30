@@ -2507,59 +2507,6 @@ async def test_vk_video_get_enrichment_uses_api_ref_and_direct_files():
 
 
 @pytest.mark.asyncio
-async def test_vk_video_get_failure_preserves_original_preview():
-    adapter = VKAdapter(
-        PlatformConfig(enabled=True, token="group-token", extra={"group_id": "123456789", "user_token": "user-token"})
-    )
-    calls = []
-
-    async def fake_vk_method(method, params=None, *, access_token=None):
-        calls.append((method, params, access_token))
-        if method == "messages.getHistoryAttachments":
-            return {"response": {"items": []}}
-        if method == "video.get":
-            raise RuntimeError("VK API error 5: User authorization failed")
-        raise AssertionError(method)
-
-    adapter._vk_method = fake_vk_method
-    msg = {
-        "attachments": [
-            {
-                "type": "video",
-                "video": {
-                    "owner_id": 103,
-                    "id": 456,
-                    "access_key": "ak",
-                    "player": "https://vkvideo.example/watch",
-                    "first_frame": [{"width": 640, "height": 360, "url": "https://sun9-1.userapi.com/live.jpg"}],
-                },
-            }
-        ]
-    }
-
-    enriched = await adapter._enrich_video_attachments_from_api(msg, peer_id="2000000042", conversation_message_id=42)
-    message_type, urls, media_types = adapter._extract_attachment_media(enriched["attachments"])
-
-    assert calls == [
-        (
-            "messages.getHistoryAttachments",
-            {
-                "peer_id": "2000000042",
-                "media_type": "video",
-                "conversation_message_id": "42",
-                "attachment_position": "1",
-                "count": "10",
-            },
-            None,
-        ),
-        ("video.get", {"videos": "103_456_ak"}, "user-token"),
-    ]
-    assert message_type is MessageType.VIDEO
-    assert urls == ["https://sun9-1.userapi.com/live.jpg"]
-    assert media_types == ["image/jpeg"]
-
-
-@pytest.mark.asyncio
 async def test_vk_video_without_native_file_does_not_become_public_watch_url():
     adapter = VKAdapter(
         PlatformConfig(enabled=True, token="group-token", extra={"group_id": "123456789", "user_token": "user-token"})

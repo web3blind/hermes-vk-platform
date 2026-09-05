@@ -3372,11 +3372,11 @@ class VKAdapter(BasePlatformAdapter):
         commands must use the gateway's explicit text fallback instead.
         """
         from tools import approval
-        from gateway.run import _redact_approval_command
+        from agent.redact import redact_sensitive_text
         with approval._lock:
             candidates = [entry for entry in approval._gateway_queues.get(session_key, ())
                           if not entry.event.is_set() and entry.result is None
-                          and _redact_approval_command(entry.data.get("command", "")) == command
+                          and redact_sensitive_text(str(entry.data.get("command") or ""), force=True) == command
                           and entry.data.get("description", "dangerous command") == description]
             return candidates[0] if len(candidates) == 1 else None
 

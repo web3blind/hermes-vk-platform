@@ -58,6 +58,14 @@ from plugins.platforms.vk.adapter import (
 )
 from plugins.platforms.vk.setup_helper import import_project_lanes_to_vk
 
+# Hermes September decomposition moved waiter implementation, not queue ownership.
+try:
+    from tools.approval_gateway_wait import _ApprovalEntry, _await_gateway_decision
+    from tools import approval_context as _wait_context
+except ImportError:
+    from tools.approval import _ApprovalEntry, _await_gateway_decision
+    from tools import approval as _wait_context
+
 
 @pytest.fixture(autouse=True)
 def clear_vk_env(monkeypatch, tmp_path):
@@ -123,7 +131,7 @@ def sent_callback(calls):
 @pytest.mark.asyncio
 async def test_exec_callback_binds_peer_prompt_choices_and_exact_queue_entry(callback_env):
     adapter, calls, approval = callback_env
-    entry = approval._ApprovalEntry({"command": "touch /tmp/demo", "description": "test"})
+    entry = _ApprovalEntry({"command": "touch /tmp/demo", "description": "test"})
     approval._gateway_queues["s"] = [entry]
     result = await adapter.send_exec_approval("2000000042", "touch /tmp/demo", "s", "test", smart_denied=True)
     assert result.success
@@ -240,7 +248,7 @@ async def test_connect_warns_for_missing_callbacks_and_inspection_failure(callba
 async def test_approval_prompts_include_reply_in_original_lane_text_fallback(callback_env):
     from tools import slash_confirm
     adapter, calls, approval = callback_env
-    approval._gateway_queues["s"] = [approval._ApprovalEntry({"command": "demo"})]
+    approval._gateway_queues["s"] = [_ApprovalEntry({"command": "demo"})]
     await adapter.send_exec_approval("2000000042", "demo", "s")
     prompt = calls[-1][1]["message"]
     assert "/approve" in prompt and "/deny" in prompt and "reply" in prompt.lower()
@@ -259,8 +267,8 @@ async def test_exec_callback_unblocks_real_waiter(callback_env, monkeypatch, cho
     adapter, calls, _ = callback_env
     loop = asyncio.get_running_loop()
     shown = asyncio.Event()
-    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 5)
-    monkeypatch.setattr(approval, "_fire_approval_hook", lambda *a, **k: None)
+    monkeypatch.setattr(_wait_context, "_get_approval_timeout", lambda: 5)
+    monkeypatch.setattr(_wait_context, "_fire_approval_hook", lambda *a, **k: None)
     async def show(data):
         result = await adapter.send_exec_approval("2000000042", data["command"], "waiter", data["description"])
         assert result.success
@@ -268,7 +276,7 @@ async def test_exec_callback_unblocks_real_waiter(callback_env, monkeypatch, cho
     def notify(data):
         asyncio.run_coroutine_threadsafe(show(data), loop).result(timeout=3)
     task = asyncio.create_task(asyncio.to_thread(
-        approval._await_gateway_decision, "waiter", notify,
+        _await_gateway_decision, "waiter", notify,
         {"command": "test-only-no-execution", "description": "waiter test"}))
     try:
         await asyncio.wait_for(shown.wait(), timeout=4)
@@ -288,8 +296,8 @@ async def test_exec_fifo_and_stale_prompt_never_resolve_another_request(callback
     import threading
     adapter, calls, approval = callback_env
     monkeypatch.setattr(approval, "_lock", getattr(threading, lock_kind)())
-    first = approval._ApprovalEntry({"command": "first"})
-    second = approval._ApprovalEntry({"command": "second"})
+    first = _ApprovalEntry({"command": "first"})
+    second = _ApprovalEntry({"command": "second"})
     approval._gateway_queues["s"] = [first, second]
     assert (await adapter.send_exec_approval("2000000042", "first", "s")).success
     a = sent_callback(calls)
@@ -306,7 +314,7 @@ async def test_exec_fifo_and_stale_prompt_never_resolve_another_request(callback
     assert not second.event.is_set()
     await adapter._handle_update(callback_update({**b, "vkea": "deny"}))
     assert second.event.is_set() and second.result == "deny"
-    third = approval._ApprovalEntry({"command": "third"})
+    third = _ApprovalEntry({"command": "third"})
     approval._gateway_queues["s"] = [third]
     await adapter._handle_update(callback_update(b))
     assert not third.event.is_set()
@@ -320,7 +328,7 @@ async def test_button_send_error_never_suppresses_text_fallback(callback_env, ki
     adapter._vk_method = AsyncMock(return_value={"response": [{"peer_id": 2000000042,
         "error": {"error_code": 901, "error_msg": "cannot send"}}]})
     if kind == "exec":
-        approval._gateway_queues["s"] = [approval._ApprovalEntry({"command": "demo"})]
+        approval._gateway_queues["s"] = [_ApprovalEntry({"command": "demo"})]
         result = await adapter.send_exec_approval("2000000042", "demo", "s")
     elif kind == "slash":
         slash_confirm.register("s", "id", "reload", AsyncMock())
@@ -1869,7 +1877,7 @@ async def test_vk_send_exec_approval_renders_full_button_set(monkeypatch, tmp_pa
 
     from tools import approval
     monkeypatch.setattr(approval, "_gateway_queues", {"agent:main:vk:thread:2000000042:lane:gito": [
-        approval._ApprovalEntry({"command": "touch /tmp/demo", "description": "dangerous command"})]})
+        _ApprovalEntry({"command": "touch /tmp/demo", "description": "dangerous command"})]})
     result = await adapter.send_exec_approval(
         chat_id="2000000042",
         command="touch /tmp/demo",
@@ -1905,7 +1913,7 @@ async def test_vk_send_exec_approval_smart_deny_renders_two_buttons(monkeypatch,
 
     from tools import approval
     monkeypatch.setattr(approval, "_gateway_queues", {"s": [
-        approval._ApprovalEntry({"command": "curl example.test", "description": "dangerous command"})]})
+        _ApprovalEntry({"command": "curl example.test", "description": "dangerous command"})]})
     result = await adapter.send_exec_approval(
         chat_id="2000000042",
         command="curl example.test",
@@ -1923,7 +1931,7 @@ async def test_vk_send_exec_approval_smart_deny_renders_two_buttons(monkeypatch,
 @pytest.mark.asyncio
 async def test_vk_exec_approval_callback_resolves_and_edits_prompt(callback_env):
     adapter, calls, approval = callback_env
-    entry = approval._ApprovalEntry({"command": "demo", "description": "test"})
+    entry = _ApprovalEntry({"command": "demo", "description": "test"})
     approval._gateway_queues["s"] = [entry]
     await adapter.send_exec_approval("2000000042", "demo", "s", "test")
     payload = sent_callback(calls)

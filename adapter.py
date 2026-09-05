@@ -19,6 +19,8 @@ import os
 import random
 import re
 import sqlite3
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +31,7 @@ from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
 from gateway.config import Platform
+from gateway.session import build_session_key
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -44,6 +47,8 @@ logger = logging.getLogger(__name__)
 VK_API_VERSION = "5.199"
 VK_API_BASE = "https://api.vk.com/method"
 DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_PENDING_INTAKE = 128
+INTAKE_CONTROL_RESERVE = 16
 DEFAULT_DEDUPE_TTL_SECONDS = 30 * 60
 VK_TRANSIENT_RETRY_DELAY_SECONDS = 5.0
 VALID_ACCESS_POLICIES = {"any", "user_only", "peer_only", "peer_and_user"}
@@ -721,6 +726,7 @@ def _download_attachment(
     *,
     timeout: int = 60,
     max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Download a VK attachment to a bounded local cache path.
 
@@ -738,9 +744,15 @@ def _download_attachment(
     cache_dir = get_hermes_home() / "cache" / "vk" / "attachments"
     cache_dir.mkdir(parents=True, exist_ok=True)
     target = cache_dir / f"vk_{digest}{suffix}"
+    temporary: Optional[Path] = None
+
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("VK attachment download cancelled")
 
     req = urllib.request.Request(url, headers={"User-Agent": "Hermes-VK-Adapter/0.1"})
     try:
+        check_cancelled()
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - VK-provided attachment URL
             content_length = resp.headers.get("Content-Length")
             if content_length:
@@ -759,19 +771,25 @@ def _download_attachment(
                 if declared_top in {"image", "video", "audio"} and content_top != declared_top:
                     raise RuntimeError(f"VK attachment content type mismatch: {content_type} for {declared_type}")
             total = 0
-            with target.open("wb") as fh:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=cache_dir, prefix=".vk-", suffix=".part", delete=False) as fh:
+                temporary = Path(fh.name)
                 while True:
+                    check_cancelled()
                     chunk = resp.read(64 * 1024)
+                    check_cancelled()
                     if not chunk:
                         break
                     total += len(chunk)
                     if total > max_bytes:
-                        fh.close()
-                        target.unlink(missing_ok=True)
                         raise RuntimeError(f"VK attachment exceeded size limit: {total} bytes > {max_bytes}")
                     fh.write(chunk)
+            check_cancelled()
+            os.replace(temporary, target)
     except urllib.error.URLError as exc:
         raise RuntimeError(_redact_token(str(exc))) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return str(target)
 
 
@@ -782,7 +800,26 @@ async def _download_attachment_async(
     timeout: int = 60,
     max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
 ) -> str:
-    return await asyncio.to_thread(_download_attachment, url, media_type, timeout=timeout, max_bytes=max_bytes)
+    cancel_event = threading.Event()
+    worker = asyncio.create_task(asyncio.to_thread(
+        _download_attachment, url, media_type, timeout=timeout,
+        max_bytes=max_bytes, cancel_event=cancel_event))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        # A cancelled asyncio wrapper does not stop a running OS thread. Join
+        # even across repeated cancellations before the caller releases its slot.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()  # consume cancellation/IO failure from the worker
+        raise
 
 
 def _looks_like_downloadable_attachment_url(url: str) -> bool:
@@ -912,6 +949,14 @@ class VKAdapter(BasePlatformAdapter):
             25,
         )
 
+        self._inbound_route_lock = asyncio.Lock()
+        self._download_semaphore = asyncio.Semaphore(3)
+        self._intake_tasks: dict[asyncio.Task, str] = {}
+        self._intake_tails: dict[str, asyncio.Task] = {}
+        self._intake_barriers: dict[str, asyncio.Task] = {}
+        self._intake_controls: set[asyncio.Task] = set()
+        self._overflow_notices: dict[str, asyncio.Task] = {}
+        self._intake_closing = False
         self._poll_task: Optional[asyncio.Task] = None
         self._fallback_poll_task: Optional[asyncio.Task] = None
         self._fallback_last_cmid: dict[str, int] = {}
@@ -974,6 +1019,7 @@ class VKAdapter(BasePlatformAdapter):
             return False
 
         await self._diagnose_callback_settings()
+        self._intake_closing = False
         self._poll_task = asyncio.create_task(self._poll_loop(), name="vk-longpoll")
         if self.fallback_poll_enabled:
             self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
@@ -999,6 +1045,7 @@ class VKAdapter(BasePlatformAdapter):
             logger.warning("VK: could not inspect Long Poll callback settings; verify message_event manually (connection continues).")
 
     async def disconnect(self) -> None:
+        self._intake_closing = True
         for task in (self._poll_task, self._fallback_poll_task):
             if task and not task.done():
                 task.cancel()
@@ -1008,6 +1055,15 @@ class VKAdapter(BasePlatformAdapter):
                     pass
         self._poll_task = None
         self._fallback_poll_task = None
+        tasks = [*self._intake_tasks, *self._overflow_notices.values()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._intake_tasks.clear()
+        self._intake_tails.clear()
+        self._intake_barriers.clear()
+        self._intake_controls.clear()
+        self._overflow_notices.clear()
         self._mark_disconnected()
         await self._release_lock()
 
@@ -2385,13 +2441,29 @@ class VKAdapter(BasePlatformAdapter):
     async def _handle_update(self, update: dict[str, Any]) -> None:
         update_type = str(update.get("type") or "")
         if update_type == "message_event":
-            try:
-                await self._handle_message_event_update(update)
-            except Exception as exc:
-                logger.warning("VK: project callback handling failed safely — %s", _redact_token(str(exc)))
+            if self._intake_closing:
+                return
+            if len(self._intake_tasks) >= MAX_PENDING_INTAKE + INTAKE_CONTROL_RESERVE:
+                logger.warning("VK: callback intake capacity exceeded")
+                return
+            async def callback() -> None:
+                try:
+                    await self._handle_message_event_update(update)
+                except Exception as exc:
+                    logger.warning("VK: project callback handling failed safely — %s", _redact_token(str(exc)))
+            self._track_intake(asyncio.create_task(callback(), name="vk-callback"), "")
+            await asyncio.sleep(0)
             return
         if update_type not in {"message_new", "message_edit"}:
             return
+        # Long Poll and fallback may overlap during API enrichment. Preserve
+        # arrival order through route selection only, never through download.
+        async with self._inbound_route_lock:
+            if not self._intake_closing:
+                await self._handle_message_update(update)
+
+    async def _handle_message_update(self, update: dict[str, Any]) -> None:
+        update_type = str(update.get("type") or "")
         obj = update.get("object") or {}
         msg = obj.get("message") or obj
         if not isinstance(msg, dict):
@@ -2428,8 +2500,6 @@ class VKAdapter(BasePlatformAdapter):
                 media_type = nested_media_type
             media_urls.extend(nested_media_urls)
             media_types.extend(nested_media_types)
-        if media_urls:
-            media_urls = await self._materialize_inbound_media(media_type, media_urls, media_types)
         attachment_summary = self._summarize_attachments(attachments) if attachments else ""
         if attachment_summary:
             text = self._merge_caption(text, attachment_summary)
@@ -2665,7 +2735,111 @@ class VKAdapter(BasePlatformAdapter):
             auto_skill=event_auto_skill,
             channel_prompt=event_channel_prompt,
         )
-        await self.handle_message(event)
+        from hermes_cli.commands import should_bypass_active_session
+        if event.allow_gateway_control and should_bypass_active_session(event.get_command()):
+            original_text = self._strip_bot_mention_prefix(str(msg.get("text") or "").strip())
+            if original_text.startswith("/"):
+                # Attachment/reply summaries are context, never control arguments.
+                event.text = original_text
+        await self._dispatch_inbound(event)
+
+    async def _dispatch_inbound(self, event: MessageEvent) -> None:
+        """Freeze routing at intake; serialize dispatch, never an agent's lifetime."""
+        if self._intake_closing:
+            return
+        key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        previous = self._intake_tails.get(key)
+        # Core owns authorization and resolution of textual controls. Only
+        # bypass intake ordering; never resolve a waiter here or bypass core.
+        from tools.clarify_gateway import has_pending
+        from hermes_cli.commands import is_interrupt_then_dispatch, should_bypass_active_session
+        from gateway.platforms.base import coerce_plaintext_gateway_command
+        coerce_plaintext_gateway_command(event)
+        command = event.get_command()
+        barrier = self._intake_barriers.get(key)
+        if barrier is not None and barrier.done():
+            barrier = None
+        interrupt = event.allow_gateway_control and is_interrupt_then_dispatch(command)
+        urgent = event.allow_gateway_control and (
+            should_bypass_active_session(command)
+            or (not command and not event.media_urls and barrier is None and has_pending(key)))
+        if urgent and command:
+            # Core controls operate on session state, not attached/replied files.
+            event.media_urls = []
+            event.media_types = []
+        limit = MAX_PENDING_INTAKE + (INTAKE_CONTROL_RESERVE if urgent else 0)
+        if len(self._intake_tasks) >= limit:
+            self._notify_intake_overflow(event.source.chat_id)
+            await asyncio.sleep(0)
+            return
+        if interrupt:
+            # Core cannot see messages still downloading in this adapter.
+            # Cancel only this exact session; joined worker cleanup stays tracked.
+            for pending, pending_key in list(self._intake_tasks.items()):
+                if pending_key == key and pending not in self._intake_controls:
+                    pending.cancel()
+            self._intake_tails.pop(key, None)
+        if urgent:
+            previous = barrier
+
+        async def deliver() -> None:
+            if previous is not None and not previous.done():
+                # Cancelling a queued followup must not cancel its predecessor.
+                await asyncio.gather(asyncio.shield(previous), return_exceptions=True)
+            if event.media_urls:
+                event.media_urls = await self._materialize_inbound_media(
+                    event.message_type, event.media_urls, event.media_types)
+            await self.handle_message(event)
+
+        task = asyncio.create_task(deliver(), name="vk-inbound")
+        self._track_intake(task, key)
+        if not urgent or interrupt:
+            self._intake_tails[key] = task
+        if interrupt:
+            self._intake_controls.add(task)
+            self._intake_barriers[key] = task
+        # Start immediate work, but never await an arbitrarily slow core handler.
+        await asyncio.sleep(0)
+
+    def _notify_intake_overflow(self, peer_id: str) -> None:
+        """Coalesce slow rejection notices without consuming control slots."""
+        if self._intake_closing or peer_id in self._overflow_notices:
+            return
+        if len(self._overflow_notices) >= INTAKE_CONTROL_RESERVE:
+            logger.warning("VK: overload notice capacity exceeded")
+            return
+        async def notify() -> None:
+            try:
+                await self._send_project_text(
+                    peer_id,
+                    "Очередь обработки вложений заполнена. Сообщение не принято; повторите его позже.")
+            except Exception as exc:
+                logger.warning("VK: overload notice failed — %s", _redact_token(str(exc)))
+            finally:
+                self._overflow_notices.pop(peer_id, None)
+        task = asyncio.create_task(notify(), name="vk-overload-notice")
+        self._overflow_notices[peer_id] = task
+        task.add_done_callback(lambda done: self._overflow_notices.pop(peer_id, None)
+                               if self._overflow_notices.get(peer_id) is done else None)
+
+    def _track_intake(self, task: asyncio.Task, key: str) -> None:
+        self._intake_tasks[task] = key
+
+        def finished(done: asyncio.Task) -> None:
+            self._intake_tasks.pop(done, None)
+            self._intake_controls.discard(done)
+            if self._intake_barriers.get(key) is done:
+                self._intake_barriers.pop(key, None)
+            if self._intake_tails.get(key) is done:
+                self._intake_tails.pop(key, None)
+            if not done.cancelled() and done.exception() is not None:
+                logger.warning("VK: inbound dispatch failed — %s", _redact_token(str(done.exception())))
+
+        task.add_done_callback(finished)
 
     async def _enrich_message_from_api(
         self,
@@ -2958,7 +3132,8 @@ class VKAdapter(BasePlatformAdapter):
                 materialized.append(url)
                 continue
             try:
-                materialized.append(await _download_attachment_async(url, media_type, max_bytes=self.max_attachment_bytes))
+                async with self._download_semaphore:
+                    materialized.append(await _download_attachment_async(url, media_type, max_bytes=self.max_attachment_bytes))
             except Exception as exc:
                 logger.warning("VK: failed to download inbound attachment — %s", _redact_token(str(exc)))
                 materialized.append(url)

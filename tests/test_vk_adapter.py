@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import os
@@ -121,6 +122,413 @@ def callback_update(payload, peer=2000000042, cmid=77, user=100):
     return {"type": "message_event", "object": {
         "peer_id": peer, "user_id": user, "conversation_message_id": cmid,
         "event_id": "evt", "payload": payload}}
+
+
+def intake_update(cmid, text="hello", *, media=False, peer=2000000042, user=100):
+    message = {"from_id": user, "peer_id": peer,
+               "conversation_message_id": cmid, "text": text}
+    if media:
+        message["attachments"] = [{"type": "audio_message", "audio_message": {
+            "link_ogg": "https://vk.example/voice.ogg"}}]
+    return {"type": "message_new", "object": {"message": message}}
+
+
+def intake_adapter():
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={
+        "allowed_peers": ["2000000042"],
+        "project_lanes": {"2000000042": {"lanes": [
+            {"id": "a", "name": "Alpha"}, {"id": "b", "name": "Beta"}]}}}))
+    adapter._vk_method = AsyncMock(return_value={"response": {}})
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+async def drain_intake(adapter):
+    results = await asyncio.gather(*list(adapter._intake_tasks), return_exceptions=True)
+    assert not [r for r in results if isinstance(r, Exception)], results
+    await asyncio.sleep(0)  # task completion callbacks remove bookkeeping
+
+
+@pytest.mark.asyncio
+async def test_vk_blocked_media_does_not_block_intake_or_other_lane(monkeypatch):
+    adapter = intake_adapter()
+    started, release = asyncio.Event(), asyncio.Event()
+    async def download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    await adapter._set_active_lane_id("2000000042", "100", "a")
+    intake = asyncio.create_task(adapter._handle_update(intake_update(1, "caption", media=True)))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.sleep(0)
+        assert intake.done(), "attachment download must not block the polling update handler"
+        await adapter._handle_update(intake_update(2, "followup"))
+        await adapter._handle_update(intake_update(3, "/project b"))
+        await adapter._handle_update(intake_update(4, "other lane"))
+        assert [c.args[0].text for c in adapter.handle_message.await_args_list] == ["other lane"]
+        assert adapter.handle_message.await_args.args[0].source.thread_id == "lane:b"
+        release.set()
+        await drain_intake(adapter)
+        events = [c.args[0] for c in adapter.handle_message.await_args_list]
+        assert [e.message_id for e in events] == ["4", "1", "2"]
+        assert [e.source.thread_id for e in events] == ["lane:b", "lane:a", "lane:a"]
+        assert events[1].media_urls == ["/tmp/complete.ogg"]
+        assert "caption" in events[1].text
+        assert not adapter._intake_tasks
+        assert not adapter._intake_tails
+    finally:
+        release.set()
+        await intake
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["/approve", "/deny", "/stop", "clarify answer"])
+async def test_vk_control_text_bypasses_blocked_media(monkeypatch, callback_env, text):
+    adapter, calls, _ = callback_env
+    started, release = asyncio.Event(), asyncio.Event()
+    async def download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_update(intake_update(1, media=True))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        if text == "clarify answer":
+            from tools import clarify_gateway
+            source = adapter.build_source(chat_id="2000000042", chat_type="group", user_id="100")
+            clarify_gateway.register("test-pending", build_session_key(source), "Question?", None)
+        await adapter._handle_update(intake_update(2, text))
+        assert adapter.handle_message.await_count == 1
+        assert adapter.handle_message.await_args.args[0].text == text
+        # Callback ingress still takes its existing independent path.
+        adapter._handle_message_event_update = AsyncMock()
+        await adapter._handle_update(callback_update({"vkap": "approve"}))
+        adapter._handle_message_event_update.assert_awaited_once()
+    finally:
+        release.set()
+        await drain_intake(adapter)
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_vk_download_limit_and_disconnect_join_actual_threads(monkeypatch):
+    import threading
+    adapter = intake_adapter()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    calls = []
+    def download(*args, **kwargs):
+        calls.append(args[0])
+        if len(calls) == 3:
+            loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "test did not release worker"
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment", download)
+    for user in range(100, 104):
+        await adapter._handle_update(intake_update(user, media=True, user=user))
+    shutdown = None
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert len(calls) == 3, "actual worker count must be bounded across sessions"
+        shutdown = asyncio.create_task(adapter.disconnect())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not shutdown.done(), "disconnect must join the uncancellable download threads"
+        assert adapter._download_semaphore.locked(), "cancel must not release live worker slots"
+        adapter.handle_message.assert_not_awaited()
+    finally:
+        release.set()
+        if shutdown:
+            await asyncio.wait_for(shutdown, 2)
+        else:
+            await adapter.disconnect()
+    assert len(calls) == 3
+    assert not adapter._intake_tasks
+    assert not adapter._intake_tails
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/stop", "/new", "/reset"])
+async def test_vk_reset_drops_pre_control_work_not_post_control(monkeypatch, command):
+    adapter = intake_adapter()
+    media_started, media_release = asyncio.Event(), asyncio.Event()
+    control_started, control_release = asyncio.Event(), asyncio.Event()
+    delivered = []
+    async def download(*args, **kwargs):
+        media_started.set()
+        await media_release.wait()
+        return "/tmp/complete.ogg"
+    async def dispatch(event):
+        if event.text == command:
+            control_started.set()
+            await control_release.wait()
+        delivered.append(event.text)
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    adapter.handle_message = dispatch
+    await adapter._handle_update(intake_update(1, "old media", media=True))
+    await asyncio.wait_for(media_started.wait(), 1)
+    await adapter._handle_update(intake_update(2, "old queued"))
+    control = asyncio.create_task(adapter._handle_update(intake_update(3, command)))
+    try:
+        await asyncio.wait_for(control_started.wait(), 1)
+        await asyncio.sleep(0)
+        assert control.done(), "slow core control must not block polling"
+        await adapter._handle_update(intake_update(4, "new text"))
+        await adapter._handle_update(intake_update(5, "other session", user=101))
+        assert delivered == ["other session"]
+        media_release.set()
+        control_release.set()
+        await drain_intake(adapter)
+        assert delivered == ["other session", command, "new text"]
+    finally:
+        media_release.set()
+        control_release.set()
+        await control
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_vk_intake_is_bounded_without_blocking_controls(monkeypatch):
+    adapter = intake_adapter()
+    release = asyncio.Event()
+    async def download(*args, **kwargs):
+        await release.wait()
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    monkeypatch.setattr("plugins.platforms.vk.adapter.MAX_PENDING_INTAKE", 2, raising=False)
+    adapter._send_project_text = AsyncMock()
+    try:
+        await adapter._handle_update(intake_update(1, media=True))
+        await adapter._handle_update(intake_update(2, "queued"))
+        await adapter._handle_update(intake_update(3, "overflow"))
+        assert len(adapter._intake_tasks) == 2
+        adapter._send_project_text.assert_awaited_once()
+        await adapter._handle_update(intake_update(4, "/approve"))
+        await asyncio.sleep(0)
+        assert adapter.handle_message.await_args.args[0].text == "/approve"
+    finally:
+        release.set()
+        await drain_intake(adapter)
+        await adapter.disconnect()
+    assert "overflow" not in [c.args[0].text for c in adapter.handle_message.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread,per_user,shared", [(False, True, False), (False, False, True), (True, False, True), (True, True, False)])
+async def test_vk_intake_uses_core_session_isolation(monkeypatch, thread, per_user, shared):
+    adapter = intake_adapter()
+    adapter.config.extra["thread_sessions_per_user" if thread else "group_sessions_per_user"] = per_user
+    if thread:
+        for user in (100, 101):
+            await adapter._set_active_lane_id("2000000042", str(user), "a")
+    release, started = asyncio.Event(), asyncio.Event()
+    async def download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    try:
+        await adapter._handle_update(intake_update(1, media=True))
+        await asyncio.wait_for(started.wait(), 1)
+        # Fallback replay of a Long Poll event must not enqueue or download twice.
+        await adapter._handle_update(intake_update(1, media=True))
+        await adapter._handle_update(intake_update(2, "second user", user=101))
+        assert adapter.handle_message.await_count == (0 if shared else 1)
+        assert sum(not task.done() for task in adapter._intake_tasks) == (2 if shared else 1)
+        release.set()
+        await drain_intake(adapter)
+        ids = [c.args[0].message_id for c in adapter.handle_message.await_args_list]
+        assert ids == (["1", "2"] if shared else ["2", "1"])
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_vk_concurrent_poll_sources_keep_intake_order(monkeypatch):
+    adapter = intake_adapter()
+    started, release = asyncio.Event(), asyncio.Event()
+    async def enrich(msg, **kwargs):
+        if msg["conversation_message_id"] == 1:
+            started.set()
+            await release.wait()
+        return msg
+    adapter._enrich_message_from_api = enrich
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", AsyncMock(return_value="/tmp/complete.ogg"))
+    first = asyncio.create_task(adapter._handle_update(intake_update(1, media=True)))
+    await asyncio.wait_for(started.wait(), 1)
+    second = asyncio.create_task(adapter._handle_update(intake_update(2, "followup")))
+    try:
+        await asyncio.sleep(0)
+        adapter.handle_message.assert_not_awaited()
+        release.set()
+        await asyncio.gather(first, second)
+        await drain_intake(adapter)
+        assert [c.args[0].message_id for c in adapter.handle_message.await_args_list] == ["1", "2"]
+    finally:
+        release.set()
+        await asyncio.gather(first, second)
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("followup", ["clarify answer", "/new"])
+async def test_vk_lifecycle_control_barrier_survives_pending_clarify(monkeypatch, callback_env, followup):
+    adapter, _, _ = callback_env
+    from tools import clarify_gateway
+    source = adapter.build_source(chat_id="2000000042", chat_type="group", user_id="100")
+    clarify_gateway.register("pending", build_session_key(source), "Question?", None)
+    started, release = asyncio.Event(), asyncio.Event()
+    delivered = []
+    async def dispatch(event):
+        if event.text == "/stop":
+            started.set()
+            await release.wait()
+        delivered.append(event.text)
+    adapter.handle_message = dispatch
+    try:
+        await adapter._handle_update(intake_update(1, "/stop"))
+        await asyncio.wait_for(started.wait(), 1)
+        await adapter._handle_update(intake_update(2, followup))
+        await asyncio.sleep(0)
+        assert not delivered
+        release.set()
+        await drain_intake(adapter)
+        assert delivered == ["/stop", followup]
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/stop", "/new", "/reset"])
+@pytest.mark.parametrize("reply_media", [False, True])
+async def test_media_control_interrupts_without_downloading(monkeypatch, command, reply_media):
+    adapter = intake_adapter()
+    started, release = asyncio.Event(), asyncio.Event()
+    async def download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "/tmp/complete.ogg"
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    try:
+        await adapter._handle_update(intake_update(1, media=True))
+        await asyncio.wait_for(started.wait(), 1)
+        update = intake_update(2, command, media=True)
+        if reply_media:
+            msg = update["object"]["message"]
+            msg["reply_message"] = {"attachments": msg.pop("attachments")}
+        await adapter._handle_update(update)
+        await asyncio.sleep(0)
+        assert adapter.handle_message.await_count == 1
+        event = adapter.handle_message.await_args.args[0]
+        assert event.get_command() == command[1:]
+        assert event.text == command
+        assert event.media_urls == []
+        release.set()
+        await drain_intake(adapter)
+        assert adapter.handle_message.await_count == 1
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback", [False, True])
+async def test_slow_dispatch_does_not_hold_polling(callback):
+    adapter = intake_adapter()
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def slow(*args):
+        entered.set()
+        await release.wait()
+    if callback:
+        adapter._handle_message_event_update = slow
+        update = callback_update({"vkap": "test"})
+    else:
+        adapter.handle_message = slow
+        update = intake_update(1)
+    task = asyncio.create_task(adapter._handle_update(update))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.sleep(0)
+        assert task.done(), "polling must not await a slow handler"
+        assert adapter._intake_tasks
+    finally:
+        release.set()
+        await task
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_repeated_reset_preserves_control_barrier_and_new_text(monkeypatch):
+    adapter = intake_adapter()
+    started, release = asyncio.Event(), asyncio.Event()
+    delivered, cancelled = [], []
+    monkeypatch.setattr("tools.clarify_gateway.has_pending", lambda key: True)
+    async def dispatch(event):
+        if event.text == "/new first":
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(event.text)
+                raise
+        delivered.append(event.text)
+    adapter.handle_message = dispatch
+    try:
+        await adapter._handle_update(intake_update(1, "/new first"))
+        await asyncio.wait_for(started.wait(), 1)
+        await adapter._handle_update(intake_update(2, "between resets"))
+        await adapter._handle_update(intake_update(3, "/new second"))
+        await adapter._handle_update(intake_update(4, "after resets"))
+        assert not delivered and not cancelled
+        release.set()
+        await drain_intake(adapter)
+        assert delivered == ["/new first", "/new second", "after resets"]
+        assert not adapter._intake_controls and not adapter._intake_barriers
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_slow_overflow_notice_keeps_controls_responsive(monkeypatch):
+    adapter = intake_adapter()
+    release, notice_started = asyncio.Event(), asyncio.Event()
+    async def download(*args, **kwargs):
+        await release.wait()
+        return "/tmp/complete.ogg"
+    async def notice(*args, **kwargs):
+        notice_started.set()
+        await release.wait()
+    monkeypatch.setattr("plugins.platforms.vk.adapter.MAX_PENDING_INTAKE", 1)
+    monkeypatch.setattr("plugins.platforms.vk.adapter._download_attachment_async", download)
+    adapter._send_project_text = notice
+    await adapter._handle_update(intake_update(1, media=True))
+    overflow = asyncio.create_task(adapter._handle_update(intake_update(2, "overflow")))
+    try:
+        await asyncio.wait_for(notice_started.wait(), 1)
+        await asyncio.sleep(0)
+        assert overflow.done()
+        await adapter._handle_update(intake_update(3, "/approve"))
+        assert adapter.handle_message.await_args.args[0].text == "/approve"
+        for cmid in range(4, 9):
+            await adapter._handle_update(intake_update(cmid, "overflow again"))
+        assert len(adapter._overflow_notices) == 1
+    finally:
+        release.set()
+        await overflow
+        await adapter.disconnect()
+    assert not adapter._overflow_notices
 
 
 def sent_callback(calls):
@@ -1858,6 +2266,7 @@ async def test_project_message_event_select_sets_active_lane_without_agent_dispa
         }
     )
 
+    await drain_intake(adapter)
     adapter.handle_message.assert_not_awaited()
     assert adapter._get_active_lane_id("2000000042", "100") == "tccc-ai"
     assert any(call[0] == "messages.sendMessageEventAnswer" for call in calls)
@@ -2341,6 +2750,7 @@ async def test_vk_message_new_with_attachment_builds_media_event():
                 },
             }
         )
+        await drain_intake(adapter)
 
     event = adapter.handle_message.call_args.args[0]
     assert event.message_type is MessageType.VOICE
@@ -2437,6 +2847,8 @@ async def test_vk_forwarded_photo_with_comment_routes_media_url():
             }
         )
 
+        await drain_intake(adapter)
+
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.call_args.args[0]
     assert event.text.startswith("посмотри фото")
@@ -2487,6 +2899,7 @@ async def test_vk_reply_photo_routes_media_url():
                 },
             }
         )
+        await drain_intake(adapter)
 
     event = adapter.handle_message.call_args.args[0]
     assert "[VK reply]" in event.text

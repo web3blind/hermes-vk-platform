@@ -473,6 +473,14 @@ This plugin implements `edit_message()` via VK `messages.edit`. If progress edit
 
 VK messages are chunked according to the adapter max message length. The default is `4096` characters.
 
+### Inbound attachments and responsiveness
+
+Attachment downloads run outside the Long Poll intake path. Each message keeps its original project/session routing, caption and media types. Ordinary messages in the same session wait for earlier attachments to be ready; another project can continue independently. Hermes still owns agent execution and busy/steering behavior.
+
+Downloads use at most three worker slots. Pending delivery is bounded, with reserved room for controls; ordinary overflow receives a retry notice instead of silently disappearing. Completed cache files are published atomically. A failed repeated download cannot truncate or remove a completed file already handed to an agent. Download errors retain the existing URL fallback rather than pretending a partial file is ready.
+
+Approval/clarification controls and callbacks do not wait behind downloads. `/stop`, `/new` and `/reset` cancel earlier queued work in their session; later messages follow the control operation. Controls sent as replies to media do not download that media or treat attachment summaries as command arguments. Disconnect joins download cleanup before releasing worker slots; an outstanding socket read may take up to its network timeout to finish.
+
 ## Security model
 
 - The adapter enforces its own allowlist before passing messages to Hermes.

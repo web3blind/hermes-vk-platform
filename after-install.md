@@ -20,13 +20,17 @@ VK_ALLOWED_USERS=123456
 VK_ALLOWED_PEERS=2000000001
 ```
 
-2. Restart the gateway:
+2. In VK community settings → API usage → Long Poll API, enable Long Poll and
+   the `message_new`, `message_edit`, and **`message_event`** event types.
+   `message_event` is required for callback buttons (Allow Once / Deny).
+
+3. Restart the gateway:
 
 ```bash
 hermes gateway restart
 ```
 
-3. Send a message to your VK community or an allowed VK chat.
+4. Send a message to your VK community or an allowed VK chat.
 
 ## Important safety note
 

@@ -71,7 +71,8 @@ If you prefer manual setup, edit `~/.hermes/.env` as shown below.
      **Управление сообществом → Сообщения → Настройки для бота → Возможности ботов**:
      set **Возможности ботов** to enabled and enable **Разрешать добавлять сообщество в чаты**.
 4. Enable Long Poll API for the community.
-5. Enable the `message_new` and `message_edit` event types.
+5. Enable the `message_new`, `message_edit`, and **`message_event`** event types.
+   `message_event` delivers callback button clicks, including Allow Once / Deny and slash-command confirmations. Without it, buttons can appear but never reach Hermes; message-history fallback cannot recover these clicks.
 6. Create a community token with `messages` permission.
 7. If using group conversations, allow adding the community bot to chats and add it to the target chat.
 8. Configure allowlists before starting the gateway.

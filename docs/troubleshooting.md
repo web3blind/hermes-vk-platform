@@ -60,8 +60,35 @@ In VK community settings, check:
 
 - Long Poll API is enabled;
 - API version is supported;
-- `message_new` event is enabled;
+- `message_new` is enabled for incoming messages;
+- `message_edit` is enabled for edits;
+- **`message_event` is enabled for callback buttons**;
 - community messages are enabled.
+
+### Callback buttons keep loading; Allow Once / Deny does nothing
+
+VK renders keyboards even when their Long Poll event subscription is disabled.
+Open community settings → API usage → Long Poll API → Event types and enable
+**`message_event`**. Receiving ordinary messages (`message_new`) is not enough.
+The message-history fallback only recovers text messages, not callback clicks.
+
+For an API-based diagnosis, inspect `groups.getLongPollSettings` with the community
+token without printing it. Expect `is_enabled=true` and `events.message_event=1`.
+An authorized operator can enable only `message_event=1` through
+`groups.setLongPollSettings`; preserve all other settings and read them back.
+The plugin diagnoses missing subscriptions but never changes community settings
+silently at startup.
+
+Check fresh gateway log entries for `types=message_event` after a click. If the
+event arrives but the prompt is expired, use a new request; do not reuse an old
+button after a gateway restart. If a callback is unavailable, reply to the
+original approval prompt with `/approve` or `/deny` in its original project.
+For slash confirmations use `/approve`, `/always`, or `/cancel`. Text approvals
+resolve the oldest pending operation in that project; review it before approving.
+
+Access policies still apply to buttons. An allowlisted peer permits its allowed
+participants, not just the person who started a shared lane. Use `user_only`,
+`peer_and_user`, or per-peer user allowlists when approvals must be owner-only.
 
 ### Media does not arrive as expected
 

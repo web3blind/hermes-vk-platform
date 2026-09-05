@@ -60,7 +60,9 @@ from plugins.platforms.vk.setup_helper import import_project_lanes_to_vk
 
 
 @pytest.fixture(autouse=True)
-def clear_vk_env(monkeypatch):
+def clear_vk_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
     for key in (
         "VK_GROUP_TOKEN",
         "VK_USER_TOKEN",
@@ -86,6 +88,248 @@ def clear_vk_env(monkeypatch):
     # assert config persistence override these fakes with their own captures.
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     monkeypatch.setattr("hermes_cli.config.save_config", lambda *_args, **_kwargs: None)
+
+
+@pytest.fixture
+def callback_env(monkeypatch, tmp_path):
+    from tools import approval, slash_confirm, clarify_gateway
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(approval, "_gateway_queues", {})
+    monkeypatch.setattr(slash_confirm, "_pending", {})
+    monkeypatch.setattr(clarify_gateway, "_entries", {})
+    monkeypatch.setattr(clarify_gateway, "_session_index", {})
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={
+        "group_id": "123", "allowed_peers": ["2000000042", "2000000043"]}))
+    calls = []
+    async def api(method, params=None, **kwargs):
+        calls.append((method, params or {}))
+        return {"response": [{"conversation_message_id": 77}]}
+    adapter._vk_method = api
+    return adapter, calls, approval
+
+
+def callback_update(payload, peer=2000000042, cmid=77, user=100):
+    return {"type": "message_event", "object": {
+        "peer_id": peer, "user_id": user, "conversation_message_id": cmid,
+        "event_id": "evt", "payload": payload}}
+
+
+def sent_callback(calls):
+    params = next(params for method, params in reversed(calls) if method == "messages.send")
+    return json.loads(json.loads(params["keyboard"])["buttons"][0][0]["action"]["payload"])
+
+
+@pytest.mark.asyncio
+async def test_exec_callback_binds_peer_prompt_choices_and_exact_queue_entry(callback_env):
+    adapter, calls, approval = callback_env
+    entry = approval._ApprovalEntry({"command": "touch /tmp/demo", "description": "test"})
+    approval._gateway_queues["s"] = [entry]
+    result = await adapter.send_exec_approval("2000000042", "touch /tmp/demo", "s", "test", smart_denied=True)
+    assert result.success
+    payload = sent_callback(calls)
+    for update in (callback_update(payload, peer=2000000043),
+                   callback_update(payload, cmid=78),
+                   callback_update({**payload, "vkea": "always"})):
+        await adapter._handle_update(update)
+        assert not entry.event.is_set()
+        assert payload["id"] in adapter._approval_state
+    await adapter._handle_update(callback_update(payload, user=101))  # shared peer members allowed
+    assert entry.event.is_set() and entry.result == "once"
+    assert "s" not in approval._gateway_queues
+    calls.clear()
+    await adapter._handle_update(callback_update(payload))
+    assert not any(method == "messages.edit" for method, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_slash_callback_nonce_scope_stale_and_ack_before_handler(callback_env):
+    from tools import slash_confirm
+    adapter, calls, _ = callback_env
+    handler = AsyncMock(return_value="Done")
+    slash_confirm.register("s", "core-id", "reload-mcp", handler)
+    await adapter.send_slash_confirm("2000000042", "Confirm", "Reload?", "s", "core-id")
+    payload = sent_callback(calls)
+    assert payload["id"] != "core-id"
+    for update in (callback_update(payload, peer=2000000043), callback_update(payload, cmid=99),
+                   callback_update({**payload, "vksc": "bogus"})):
+        await adapter._handle_update(update)
+        handler.assert_not_awaited()
+        assert payload["id"] in adapter._slash_confirm_state
+    async def slow_handler(choice):
+        assert calls[-1][0] == "messages.sendMessageEventAnswer"
+        assert "Approved" not in calls[-1][1]["event_data"]
+        return "Done"
+    slash_confirm._pending["s"]["handler"] = slow_handler
+    calls.clear()
+    await adapter._handle_update(callback_update(payload))
+    assert any(p.get("message") == "Done" for m, p in calls if m == "messages.send")
+    # Expiry/supersession must never paint an Approved UI.
+    slash_confirm.register("s", "core-id", "reload-mcp", handler)
+    await adapter.send_slash_confirm("2000000042", "Confirm", "Reload?", "s", "core-id")
+    newer = sent_callback(calls)
+    assert newer["id"] != payload["id"]
+    slash_confirm._pending["s"]["created_at"] = 0
+    calls.clear()
+    await adapter._handle_update(callback_update(newer))
+    handler.assert_not_awaited()
+    assert not any("Approved" in str(p) for _, p in calls)
+
+
+@pytest.mark.asyncio
+async def test_clarify_callback_scope_invalid_index_and_text_button_prompt(callback_env):
+    from tools import clarify_gateway
+    adapter, calls, _ = callback_env
+    entry = clarify_gateway.register("core", "s", "Pick?", ["First", "Second"])
+    await adapter.send_clarify("2000000042", "Pick?", ["First", "Second"], "core", "s")
+    payload = sent_callback(calls)
+    assert payload["id"] != "core"
+    for update in (callback_update(payload, peer=2000000043), callback_update(payload, cmid=99),
+                   callback_update({**payload, "vkcl": "99"}), callback_update({**payload, "vkcl": "-1"})):
+        await adapter._handle_update(update)
+        assert not entry.event.is_set()
+        assert payload["id"] in adapter._clarify_state
+    calls.clear()
+    # A VK text button is a new user cmid, never edit that as the bot prompt.
+    await adapter._handle_update({"type": "message_new", "object": {"message": {
+        "peer_id": 2000000042, "from_id": 101, "conversation_message_id": 999,
+        "text": "2", "payload": json.dumps({**payload, "vkcl": "1"})}}})
+    assert entry.event.is_set() and entry.response == "Second"
+    edits = [p for m, p in calls if m == "messages.edit"]
+    assert edits and edits[0]["conversation_message_id"] == "77"
+    assert payload["id"] not in adapter._clarify_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["[]", "null", '"string"', "{broken", [], 42])
+async def test_malformed_callback_is_acked_without_dispatch(callback_env, raw):
+    adapter, calls, _ = callback_env
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_update(callback_update(raw))
+    adapter.handle_message.assert_not_awaited()
+    assert calls and calls[0][0] == "messages.sendMessageEventAnswer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settings", [{"is_enabled": False, "events": {"message_event": 1}},
+                                      {"is_enabled": True, "events": {"message_event": 0}},
+                                      RuntimeError("not permitted")])
+async def test_connect_warns_for_missing_callbacks_and_inspection_failure(callback_env, monkeypatch, caplog, settings):
+    adapter, calls, _ = callback_env
+    async def api(method, params=None, **kwargs):
+        calls.append((method, params or {}))
+        if method == "groups.getLongPollSettings":
+            if isinstance(settings, Exception):
+                raise settings
+            return {"response": settings}
+        return {"response": {"server": "https://example.test", "key": "test", "ts": "1"}}
+    adapter._vk_method = api
+    adapter._poll_loop = AsyncMock()
+    adapter.fallback_poll_enabled = False
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda *a, **k: True)
+    adapter._release_lock = AsyncMock()
+    with caplog.at_level("WARNING"):
+        assert await adapter.connect()
+        await adapter.disconnect()
+    assert [m for m, _ in calls] == ["groups.getLongPollServer", "groups.getLongPollSettings"]
+    assert caplog.records
+    assert all("setLongPoll" not in m for m, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_approval_prompts_include_reply_in_original_lane_text_fallback(callback_env):
+    from tools import slash_confirm
+    adapter, calls, approval = callback_env
+    approval._gateway_queues["s"] = [approval._ApprovalEntry({"command": "demo"})]
+    await adapter.send_exec_approval("2000000042", "demo", "s")
+    prompt = calls[-1][1]["message"]
+    assert "/approve" in prompt and "/deny" in prompt and "reply" in prompt.lower()
+    slash_confirm.register("s", "core", "reload", AsyncMock())
+    await adapter.send_slash_confirm("2000000042", "Confirm", "Reload", "s", "core")
+    prompt = calls[-1][1]["message"]
+    assert all(command in prompt for command in ("/approve", "/always", "/cancel"))
+    assert "reply" in prompt.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice", ["once", "deny"])
+async def test_exec_callback_unblocks_real_waiter(callback_env, monkeypatch, choice):
+    import asyncio
+    from tools import approval
+    adapter, calls, _ = callback_env
+    loop = asyncio.get_running_loop()
+    shown = asyncio.Event()
+    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 5)
+    monkeypatch.setattr(approval, "_fire_approval_hook", lambda *a, **k: None)
+    async def show(data):
+        result = await adapter.send_exec_approval("2000000042", data["command"], "waiter", data["description"])
+        assert result.success
+        shown.set()
+    def notify(data):
+        asyncio.run_coroutine_threadsafe(show(data), loop).result(timeout=3)
+    task = asyncio.create_task(asyncio.to_thread(
+        approval._await_gateway_decision, "waiter", notify,
+        {"command": "test-only-no-execution", "description": "waiter test"}))
+    try:
+        await asyncio.wait_for(shown.wait(), timeout=4)
+        payload = sent_callback(calls)
+        await adapter._handle_update(callback_update({**payload, "vkea": choice}))
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=3)
+        assert result["resolved"] is True and result["choice"] == choice
+        assert "waiter" not in approval._gateway_queues
+    finally:
+        approval.clear_session("waiter")
+        await asyncio.wait_for(task, timeout=6)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lock_kind", ["Lock", "RLock"])
+async def test_exec_fifo_and_stale_prompt_never_resolve_another_request(callback_env, monkeypatch, lock_kind):
+    import threading
+    adapter, calls, approval = callback_env
+    monkeypatch.setattr(approval, "_lock", getattr(threading, lock_kind)())
+    first = approval._ApprovalEntry({"command": "first"})
+    second = approval._ApprovalEntry({"command": "second"})
+    approval._gateway_queues["s"] = [first, second]
+    assert (await adapter.send_exec_approval("2000000042", "first", "s")).success
+    a = sent_callback(calls)
+    assert (await adapter.send_exec_approval("2000000042", "second", "s")).success
+    b = sent_callback(calls)
+    assert a["id"] != b["id"]
+    await adapter._handle_update(callback_update(b))
+    assert not first.event.is_set() and not second.event.is_set()
+    assert b["id"] in adapter._approval_state
+    # Original command expires or is answered through /approve.
+    with approval._lock:
+        approval._gateway_queues["s"].remove(first)
+    await adapter._handle_update(callback_update(a))
+    assert not second.event.is_set()
+    await adapter._handle_update(callback_update({**b, "vkea": "deny"}))
+    assert second.event.is_set() and second.result == "deny"
+    third = approval._ApprovalEntry({"command": "third"})
+    approval._gateway_queues["s"] = [third]
+    await adapter._handle_update(callback_update(b))
+    assert not third.event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["exec", "slash", "clarify"])
+async def test_button_send_error_never_suppresses_text_fallback(callback_env, kind):
+    from tools import slash_confirm, clarify_gateway
+    adapter, calls, approval = callback_env
+    adapter._vk_method = AsyncMock(return_value={"response": [{"peer_id": 2000000042,
+        "error": {"error_code": 901, "error_msg": "cannot send"}}]})
+    if kind == "exec":
+        approval._gateway_queues["s"] = [approval._ApprovalEntry({"command": "demo"})]
+        result = await adapter.send_exec_approval("2000000042", "demo", "s")
+    elif kind == "slash":
+        slash_confirm.register("s", "id", "reload", AsyncMock())
+        result = await adapter.send_slash_confirm("2000000042", "Confirm", "Reload?", "s", "id")
+    else:
+        clarify_gateway.register("id", "s", "Pick", ["Yes", "No"])
+        result = await adapter.send_clarify("2000000042", "Pick", ["Yes", "No"], "id", "s")
+    assert result.success is False
+    assert not adapter._approval_state and not adapter._slash_confirm_state and not adapter._clarify_state
 
 
 def test_split_csv_accepts_strings_and_iterables():
@@ -1623,6 +1867,9 @@ async def test_vk_send_exec_approval_renders_full_button_set(monkeypatch, tmp_pa
 
     adapter._vk_method = fake_vk_method
 
+    from tools import approval
+    monkeypatch.setattr(approval, "_gateway_queues", {"agent:main:vk:thread:2000000042:lane:gito": [
+        approval._ApprovalEntry({"command": "touch /tmp/demo", "description": "dangerous command"})]})
     result = await adapter.send_exec_approval(
         chat_id="2000000042",
         command="touch /tmp/demo",
@@ -1641,7 +1888,7 @@ async def test_vk_send_exec_approval_renders_full_button_set(monkeypatch, tmp_pa
     payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
     assert [payload["vkea"] for payload in payloads] == ["once", "session", "always", "deny"]
     assert len({payload["id"] for payload in payloads}) == 1
-    assert adapter._approval_state[payloads[0]["id"]] == "agent:main:vk:thread:2000000042:lane:gito"
+    assert adapter._approval_state[payloads[0]["id"]]["session_key"] == "agent:main:vk:thread:2000000042:lane:gito"
 
 
 @pytest.mark.asyncio
@@ -1656,6 +1903,9 @@ async def test_vk_send_exec_approval_smart_deny_renders_two_buttons(monkeypatch,
 
     adapter._vk_method = fake_vk_method
 
+    from tools import approval
+    monkeypatch.setattr(approval, "_gateway_queues", {"s": [
+        approval._ApprovalEntry({"command": "curl example.test", "description": "dangerous command"})]})
     result = await adapter.send_exec_approval(
         chat_id="2000000042",
         command="curl example.test",
@@ -1671,42 +1921,21 @@ async def test_vk_send_exec_approval_smart_deny_renders_two_buttons(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_vk_exec_approval_callback_resolves_and_edits_prompt(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
-    adapter._approval_state[5] = "agent:main:vk:thread:2000000042:lane:gito"
-    calls = []
-
-    async def fake_vk_method(method, params=None, **_kwargs):
-        calls.append((method, params or {}))
-        return {"response": [{"conversation_message_id": 1}]}
-
-    adapter._vk_method = fake_vk_method
-
-    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
-        await adapter._handle_update(
-            {
-                "type": "message_event",
-                "object": {
-                    "peer_id": 2000000042,
-                    "user_id": 100,
-                    "event_id": "evt-approval",
-                    "conversation_message_id": 55,
-                    "payload": {"vkea": "session", "id": 5},
-                },
-            }
-        )
-
-    resolve.assert_called_once_with("agent:main:vk:thread:2000000042:lane:gito", "session")
-    assert 5 not in adapter._approval_state
-    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
-    edit_calls = [params for method, params in calls if method == "messages.edit"]
-    assert edit_calls and edit_calls[0]["conversation_message_id"] == "55"
-    assert "Approved for session" in edit_calls[0]["message"]
-    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
-    assert removed_keyboard["inline"] is True
-    assert removed_keyboard["buttons"] == []
-
+async def test_vk_exec_approval_callback_resolves_and_edits_prompt(callback_env):
+    adapter, calls, approval = callback_env
+    entry = approval._ApprovalEntry({"command": "demo", "description": "test"})
+    approval._gateway_queues["s"] = [entry]
+    await adapter.send_exec_approval("2000000042", "demo", "s", "test")
+    payload = sent_callback(calls)
+    calls.clear()
+    await adapter._handle_update(callback_update({**payload, "vkea": "session"}))
+    assert entry.result == "session" and entry.event.is_set()
+    assert payload["id"] not in adapter._approval_state
+    assert calls[0][0] == "messages.sendMessageEventAnswer"
+    edit = next(p for m, p in calls if m == "messages.edit")
+    assert edit["conversation_message_id"] == "77"
+    assert "Approved for session" in edit["message"]
+    assert json.loads(edit["keyboard"])["buttons"] == []
 
 @pytest.mark.asyncio
 async def test_vk_send_slash_confirm_renders_three_buttons(monkeypatch, tmp_path):
@@ -1720,6 +1949,9 @@ async def test_vk_send_slash_confirm_renders_three_buttons(monkeypatch, tmp_path
 
     adapter._vk_method = fake_vk_method
 
+    from tools import slash_confirm
+    monkeypatch.setattr(slash_confirm, "_pending", {})
+    slash_confirm.register("agent:main:vk:group:2000000042:100", "confirm-1", "reload-mcp", AsyncMock())
     result = await adapter.send_slash_confirm(
         chat_id="2000000042",
         title="/reload-mcp",
@@ -1736,49 +1968,25 @@ async def test_vk_send_slash_confirm_renders_three_buttons(monkeypatch, tmp_path
     assert labels == ["✅ Approve Once", "🔒 Always Approve", "❌ Cancel"]
     payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
     assert [payload["vksc"] for payload in payloads] == ["once", "always", "cancel"]
-    assert adapter._slash_confirm_state["confirm-1"] == "agent:main:vk:group:2000000042:100"
+    assert adapter._slash_confirm_state[payloads[0]["id"]]["session_key"] == "agent:main:vk:group:2000000042:100"
 
 
 @pytest.mark.asyncio
-async def test_vk_slash_confirm_callback_resolves_edits_and_sends_result(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
-    adapter._slash_confirm_state["confirm-1"] = "agent:main:vk:group:2000000042:100"
-    calls = []
-
-    async def fake_vk_method(method, params=None, **_kwargs):
-        calls.append((method, params or {}))
-        return {"response": [{"conversation_message_id": 1}]}
-
-    adapter._vk_method = fake_vk_method
-
-    async def fake_resolve(session_key, confirm_id, choice):
-        assert session_key == "agent:main:vk:group:2000000042:100"
-        assert confirm_id == "confirm-1"
-        assert choice == "always"
-        return "Reload complete"
-
-    with patch("tools.slash_confirm.resolve", fake_resolve):
-        await adapter._handle_update(
-            {
-                "type": "message_event",
-                "object": {
-                    "peer_id": 2000000042,
-                    "user_id": 100,
-                    "event_id": "evt-confirm",
-                    "conversation_message_id": 56,
-                    "payload": {"vksc": "always", "id": "confirm-1"},
-                },
-            }
-        )
-
-    assert "confirm-1" not in adapter._slash_confirm_state
-    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
-    edit_calls = [params for method, params in calls if method == "messages.edit"]
-    assert edit_calls and "Always approve" in edit_calls[0]["message"]
-    send_calls = [params for method, params in calls if method == "messages.send"]
-    assert send_calls and send_calls[-1]["message"] == "Reload complete"
-
+async def test_vk_slash_confirm_callback_resolves_edits_and_sends_result(callback_env):
+    from tools import slash_confirm
+    adapter, calls, _ = callback_env
+    handler = AsyncMock(return_value="Reload complete")
+    slash_confirm.register("s", "confirm-1", "reload-mcp", handler)
+    await adapter.send_slash_confirm("2000000042", "Confirm", "Reload?", "s", "confirm-1")
+    payload = sent_callback(calls)
+    calls.clear()
+    await adapter._handle_update(callback_update({**payload, "vksc": "always"}))
+    handler.assert_awaited_once_with("always")
+    assert payload["id"] not in adapter._slash_confirm_state
+    assert calls[0][0] == "messages.sendMessageEventAnswer"
+    edit = next(p for m, p in calls if m == "messages.edit")
+    assert json.loads(edit["keyboard"])["buttons"] == []
+    assert any(p.get("message") == "Reload complete" for m, p in calls if m == "messages.send")
 
 @pytest.mark.asyncio
 async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monkeypatch, tmp_path):
@@ -1808,6 +2016,11 @@ async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monke
 
     adapter._vk_method = fake_vk_method
 
+    from tools import clarify_gateway
+    monkeypatch.setattr(clarify_gateway, "_entries", {})
+    monkeypatch.setattr(clarify_gateway, "_session_index", {})
+    clarify_gateway.register("clarify-1", "agent:main:vk:thread:2000000042:lane:gito", "Question",
+        ["Да, поставить и перезагрузить", "Поставить без reboot", "Искать другой протокол"])
     result = await adapter.send_clarify(
         chat_id="2000000042",
         question="Разрешаешь обновить kernel/headers?",
@@ -1831,144 +2044,59 @@ async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monke
     assert action_types == ["text", "text", "text", "text"]
     payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
     assert [payload["vkcl"] for payload in payloads] == ["0", "1", "2", "other"]
-    assert {payload["id"] for payload in payloads} == {"clarify-1"}
-    assert adapter._clarify_state["clarify-1"] == "agent:main:vk:thread:2000000042:lane:gito"
+    assert len({payload["id"] for payload in payloads}) == 1
+    assert payloads[0]["id"] != "clarify-1"
+    assert adapter._clarify_state[payloads[0]["id"]]["session_key"] == "agent:main:vk:thread:2000000042:lane:gito"
     assert adapter._lane_state["message_lanes"]["2000000042:91"] == "gito"
 
 
 @pytest.mark.asyncio
-async def test_vk_clarify_callback_resolves_choice_and_removes_buttons(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
-    session_key = "agent:main:vk:thread:2000000042:lane:gito"
-    adapter._clarify_state["clarify-1"] = session_key
-    calls = []
-
-    async def fake_vk_method(method, params=None, **_kwargs):
-        calls.append((method, params or {}))
-        return {"response": [{"conversation_message_id": 1}]}
-
-    adapter._vk_method = fake_vk_method
-
+async def test_vk_clarify_callback_resolves_choice_and_removes_buttons(callback_env):
     from tools import clarify_gateway
-    clarify_gateway.register(
-        clarify_id="clarify-1",
-        session_key=session_key,
-        question="Pick one",
-        choices=["First choice", "Second choice", "Third choice"],
-    )
-    try:
-        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
-            await adapter._handle_update(
-                {
-                    "type": "message_event",
-                    "object": {
-                        "peer_id": 2000000042,
-                        "user_id": 100,
-                        "event_id": "evt-clarify",
-                        "conversation_message_id": 57,
-                        "payload": {"vkcl": "1", "id": "clarify-1"},
-                    },
-                }
-            )
-    finally:
-        clarify_gateway.clear_session(session_key)
-
-    resolve.assert_called_once_with("clarify-1", "Second choice")
-    assert "clarify-1" not in adapter._clarify_state
-    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
-    edit_calls = [params for method, params in calls if method == "messages.edit"]
-    assert edit_calls and edit_calls[0]["conversation_message_id"] == "57"
-    assert "Second choice" in edit_calls[0]["message"]
-    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
-    assert removed_keyboard["inline"] is True
-    assert removed_keyboard["buttons"] == []
-
+    adapter, calls, _ = callback_env
+    entry = clarify_gateway.register("clarify-1", "s", "Pick", ["First", "Second"])
+    await adapter.send_clarify("2000000042", "Pick", ["First", "Second"], "clarify-1", "s")
+    payload = sent_callback(calls)
+    calls.clear()
+    await adapter._handle_update(callback_update({**payload, "vkcl": "1"}))
+    assert entry.event.is_set() and entry.response == "Second"
+    assert payload["id"] not in adapter._clarify_state
+    assert calls[0][0] == "messages.sendMessageEventAnswer"
+    edit = next(p for m, p in calls if m == "messages.edit")
+    assert edit["conversation_message_id"] == "77" and "Second" in edit["message"]
+    assert json.loads(edit["keyboard"])["buttons"] == []
 
 @pytest.mark.asyncio
-async def test_vk_clarify_text_button_message_new_payload_resolves_choice(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
-    session_key = "agent:main:vk:thread:2000000042:lane:gito"
-    adapter._clarify_state["clarify-text"] = session_key
+async def test_vk_clarify_text_button_message_new_payload_resolves_choice(callback_env):
+    from tools import clarify_gateway
+    adapter, calls, _ = callback_env
     adapter.handle_message = AsyncMock()
-    calls = []
-
-    async def fake_vk_method(method, params=None, **_kwargs):
-        calls.append((method, params or {}))
-        return {"response": {"items": []}}
-
-    adapter._vk_method = fake_vk_method
-
-    from tools import clarify_gateway
-    clarify_gateway.register(
-        clarify_id="clarify-text",
-        session_key=session_key,
-        question="Pick one",
-        choices=["First choice", "Second choice"],
-    )
-    try:
-        with patch("tools.clarify_gateway.resolve_gateway_clarify", return_value=True) as resolve:
-            await adapter._handle_update(
-                {
-                    "type": "message_new",
-                    "object": {
-                        "message": {
-                            "from_id": 100,
-                            "peer_id": 2000000042,
-                            "conversation_message_id": 58,
-                            "text": "2",
-                            "payload": json.dumps({"vkcl": "1", "id": "clarify-text"}),
-                        }
-                    },
-                }
-            )
-    finally:
-        clarify_gateway.clear_session(session_key)
-
-    resolve.assert_called_once_with("clarify-text", "Second choice")
+    entry = clarify_gateway.register("clarify-text", "s", "Pick", ["First", "Second"])
+    await adapter.send_clarify("2000000042", "Pick", ["First", "Second"], "clarify-text", "s")
+    payload = sent_callback(calls)
+    await adapter._handle_update({"type": "message_new", "object": {"message": {
+        "peer_id": 2000000042, "from_id": 100, "conversation_message_id": 58,
+        "text": "2", "payload": json.dumps({**payload, "vkcl": "1"})}}})
+    assert entry.response == "Second"
     adapter.handle_message.assert_not_awaited()
-    assert "clarify-text" not in adapter._clarify_state
-
-
+    assert payload["id"] not in adapter._clarify_state
 
 @pytest.mark.asyncio
-async def test_vk_clarify_other_callback_switches_to_text_capture(monkeypatch, tmp_path):
-    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
-    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={"group_id": "123456789", "allowed_users": ["100"], "allowed_peers": ["2000000042"]}))
-    adapter._clarify_state["clarify-2"] = "agent:main:vk:group:2000000042:100"
-    calls = []
-
-    async def fake_vk_method(method, params=None, **_kwargs):
-        calls.append((method, params or {}))
-        return {"response": [{"conversation_message_id": 1}]}
-
-    adapter._vk_method = fake_vk_method
-
-    with patch("tools.clarify_gateway.mark_awaiting_text", return_value=True) as mark:
-        await adapter._handle_update(
-            {
-                "type": "message_event",
-                "object": {
-                    "peer_id": 2000000042,
-                    "user_id": 100,
-                    "event_id": "evt-clarify-other",
-                    "conversation_message_id": 58,
-                    "payload": {"vkcl": "other", "id": "clarify-2"},
-                },
-            }
-        )
-
-    mark.assert_called_once_with("clarify-2")
-    assert adapter._clarify_state["clarify-2"] == "agent:main:vk:group:2000000042:100"
-    assert any(method == "messages.sendMessageEventAnswer" for method, _params in calls)
-    edit_calls = [params for method, params in calls if method == "messages.edit"]
-    assert edit_calls and edit_calls[0]["conversation_message_id"] == "58"
-    assert "Напиши свой ответ" in edit_calls[0]["message"]
-    removed_keyboard = json.loads(edit_calls[0]["keyboard"])
-    assert removed_keyboard["inline"] is True
-    assert removed_keyboard["buttons"] == []
-
+async def test_vk_clarify_other_callback_switches_to_text_capture(callback_env):
+    from tools import clarify_gateway
+    adapter, calls, _ = callback_env
+    entry = clarify_gateway.register("clarify-other", "s", "Pick", ["First", "Second"])
+    await adapter.send_clarify("2000000042", "Pick", ["First", "Second"], "clarify-other", "s")
+    payload = sent_callback(calls)
+    calls.clear()
+    await adapter._handle_update(callback_update({**payload, "vkcl": "other"}))
+    assert entry.awaiting_text and not entry.event.is_set()
+    assert payload["id"] not in adapter._clarify_state
+    edit = next(p for m, p in calls if m == "messages.edit")
+    assert edit["conversation_message_id"] == "77" and "Напиши свой ответ" in edit["message"]
+    assert json.loads(edit["keyboard"])["buttons"] == []
+    await adapter._handle_update(callback_update(payload))
+    assert not entry.event.is_set()
 
 @pytest.mark.asyncio
 async def test_vk_send_clarify_oversized_choices_uses_numbered_text_fallback(monkeypatch, tmp_path):

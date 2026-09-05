@@ -219,7 +219,9 @@ def _print_vk_prerequisites() -> None:
 VK community prerequisites:
   1. Create or choose a VK community.
   2. Enable community messages.
-  3. Enable bot/Long Poll API message events for the community.
+  3. Enable Long Poll API and its message_new, message_edit, message_event events.
+     message_event is required for callback buttons, including approval/deny.
+     Normal text messages working does not prove callback delivery is enabled.
   4. For group conversations, enable the VK setting that allows the community
      bot to work in chats / be added to conversations. If this is off, VK may
      return API error 912: "This is a chat bot feature".

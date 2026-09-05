@@ -172,8 +172,9 @@ If Hermes changes these fields, update `_lane_last_activity()` and tests. The ad
 
 The adapter relies on these VK API methods:
 
-- `groups.getLongPollServer`;
-- Long Poll `message_new` / `message_edit`;
+- `groups.getLongPollServer` and read-only `groups.getLongPollSettings`;
+- Long Poll `message_new` / `message_edit` / **`message_event`**;
+- `messages.sendMessageEventAnswer` for callback acknowledgement;
 - `messages.send`;
 - `messages.edit`;
 - `messages.getInviteLink`;

@@ -924,10 +924,9 @@ class VKAdapter(BasePlatformAdapter):
         self._conversation_context_cache: dict[str, tuple[str, str]] = {}
         self._seen_message_keys: dict[str, float] = {}
         self._seen_edit_keys: dict[str, float] = {}
-        self._approval_counter = 0
-        self._approval_state: dict[int, str] = {}
-        self._slash_confirm_state: dict[str, str] = {}
-        self._clarify_state: dict[str, str] = {}
+        self._approval_state: dict[str, dict[str, Any]] = {}
+        self._slash_confirm_state: dict[str, dict[str, Any]] = {}
+        self._clarify_state: dict[str, dict[str, Any]] = {}
         try:
             raw_project_lanes = extra.get("project_lanes")
             raw_platforms = extra.get("platforms") if isinstance(extra.get("platforms"), dict) else None
@@ -974,12 +973,30 @@ class VKAdapter(BasePlatformAdapter):
             await self._release_lock()
             return False
 
+        await self._diagnose_callback_settings()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="vk-longpoll")
         if self.fallback_poll_enabled:
             self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
         self._mark_connected()
         logger.info("VK: connected to group %s via long poll", self.group_id)
         return True
+
+    async def _diagnose_callback_settings(self) -> None:
+        """Read-only, bounded startup warning; never reconfigure a community."""
+        try:
+            payload = await asyncio.wait_for(
+                self._vk_method("groups.getLongPollSettings", {"group_id": self.group_id}),
+                timeout=5.0,
+            )
+            settings = payload.get("response")
+            if not isinstance(settings, dict) or not isinstance(settings.get("events"), dict):
+                raise ValueError("settings unavailable")
+            if settings.get("is_enabled") not in (True, 1, "1"):
+                logger.warning("VK: Long Poll is disabled; enable it in community API settings. Startup does not change VK settings.")
+            if settings["events"].get("message_event") not in (True, 1, "1"):
+                logger.warning("VK: message_event is disabled; approval buttons will not arrive. Enable Message event in community Long Poll settings; reply /approve or /deny to the prompt meanwhile.")
+        except Exception:
+            logger.warning("VK: could not inspect Long Poll callback settings; verify message_event manually (connection continues).")
 
     async def disconnect(self) -> None:
         for task in (self._poll_task, self._fallback_poll_task):
@@ -1549,7 +1566,7 @@ class VKAdapter(BasePlatformAdapter):
             rows.append(row)
         return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
 
-    def _exec_approval_keyboard(self, approval_id: int, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> str:
+    def _exec_approval_keyboard(self, approval_id: str, *, allow_permanent: bool, allow_session: bool, smart_denied: bool) -> str:
         buttons: list[tuple[str, dict[str, Any]]] = [
             ("✅ Allow Once", {"vkea": "once", "id": approval_id}),
         ]
@@ -1813,71 +1830,41 @@ class VKAdapter(BasePlatformAdapter):
         if payload.get("vkcl") is None:
             return False
 
-        choice_token = str(payload.get("vkcl") or "")
-        clarify_id = str(payload.get("id") or "")
-        session_key = self._clarify_state.get(clarify_id)
-        if not clarify_id or not session_key:
-            await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже обработан или устарел")
-            return True
-
-        if choice_token == "other":
-            flipped = False
-            try:
-                from tools.clarify_gateway import mark_awaiting_text
-
-                flipped = mark_awaiting_text(clarify_id)
-            except Exception as exc:
-                logger.error("VK: clarify Other callback failed — %s", _redact_token(str(exc)), exc_info=True)
-            if not flipped:
-                self._clarify_state.pop(clarify_id, None)
-                await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже устарел")
-                return True
-            label = "✏️ Напиши свой ответ в чат"
-            await self._answer_message_event(event_id, user_id, peer_id, label)
-            if message_id:
-                await self._edit_project_text(peer_id, f"cmid:{message_id}", "✏️ Напиши свой ответ в чат.", keyboard=self._empty_inline_keyboard())
-            return True
-
-        try:
-            idx = int(choice_token)
-        except (TypeError, ValueError):
-            await self._answer_message_event(event_id, user_id, peer_id, "Некорректный вариант")
-            return True
-
-        resolved_text: Optional[str] = None
-        try:
-            from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-
-            entry = _clarify_entries.get(clarify_id)
-            if entry and entry.choices and 0 <= idx < len(entry.choices):
-                resolved_text = str(entry.choices[idx])
-        except Exception:
-            resolved_text = None
-
-        if resolved_text is None:
-            await self._answer_message_event(event_id, user_id, peer_id, "Вопрос уже устарел")
-            self._clarify_state.pop(clarify_id, None)
+        choice_token = str(payload.get("vkcl"))
+        callback_id = str(payload.get("id") or "")
+        record = self._clarify_state.get(callback_id)
+        if not self._valid_callback(record, peer_id, message_id, choice_token, text_button=not event_id):
+            await self._answer_message_event(event_id, user_id, peer_id, "Вопрос устарел или некорректный вариант")
             return True
 
         resolved = False
+        resolved_text = None
         try:
-            from tools.clarify_gateway import resolve_gateway_clarify
-
-            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+            from tools import clarify_gateway
+            with clarify_gateway._lock:
+                entry = clarify_gateway._entries.get(record["core_id"])
+                if entry is record["entry"] and not entry.event.is_set() and not entry.awaiting_text:
+                    if choice_token == "other":
+                        resolved = clarify_gateway.mark_awaiting_text(record["core_id"])
+                    else:
+                        resolved_text = record["answers"][int(choice_token)]
+                        resolved = clarify_gateway.resolve_gateway_clarify(record["core_id"], resolved_text)
         except Exception as exc:
             logger.error("VK: failed to resolve clarify button — %s", _redact_token(str(exc)), exc_info=True)
-        self._clarify_state.pop(clarify_id, None)
+        # Other is also single-use: the core keeps the free-text waiter, but
+        # replayed buttons must not overwrite it or resolve a later question.
+        self._clarify_state.pop(callback_id, None)
         if resolved:
-            label = f"✓ {resolved_text[:60]}"
-            try:
-                self.resume_typing_for_chat(str(peer_id))
-            except Exception:
-                pass
+            label = "✏️ Напиши свой ответ в чат" if choice_token == "other" else f"✓ {resolved_text[:60]}"
+            if choice_token != "other":
+                try:
+                    self.resume_typing_for_chat(str(peer_id))
+                except Exception:
+                    pass
         else:
             label = "⌛ Вопрос устарел"
         await self._answer_message_event(event_id, user_id, peer_id, label)
-        if message_id:
-            await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+        await self._edit_project_text(peer_id, record["message_id"], label, keyboard=self._empty_inline_keyboard())
         return True
 
     async def _handle_message_event_update(self, update: dict[str, Any]) -> None:
@@ -1898,28 +1885,32 @@ class VKAdapter(BasePlatformAdapter):
         else:
             payload = raw_payload if isinstance(raw_payload, dict) else {}
 
+        if not isinstance(payload, dict) or not payload:
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
+            return
+
         if payload.get("vkea") is not None:
             choice = str(payload.get("vkea") or "")
             if choice not in {"once", "session", "always", "deny"}:
                 await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
                 return
-            try:
-                approval_id = int(payload.get("id"))
-            except (TypeError, ValueError):
-                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
-                return
-            session_key = self._approval_state.pop(approval_id, None)
-            if not session_key:
+            approval_id = str(payload.get("id") or "")
+            record = self._approval_state.get(approval_id)
+            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
+            if not self._valid_callback(record, peer_id, message_id, choice):
                 await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Подтверждение уже обработано или устарело")
                 return
             try:
-                from tools.approval import resolve_gateway_approval
-
-                count = resolve_gateway_approval(session_key, choice)
+                status = self._resolve_exec_entry(record, choice)
             except Exception as exc:
                 logger.error("VK: failed to resolve approval button — %s", _redact_token(str(exc)), exc_info=True)
-                count = 0
-            if count:
+                status = "expired"
+            if status == "out_of_order":
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id,
+                                                 "Сначала ответьте на более раннее подтверждение")
+                return
+            self._approval_state.pop(approval_id, None)
+            if status == "resolved":
                 label_map = {
                     "once": "✅ Approved once",
                     "session": "✅ Approved for session",
@@ -1944,29 +1935,34 @@ class VKAdapter(BasePlatformAdapter):
             if choice not in {"once", "always", "cancel"}:
                 await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
                 return
-            confirm_id = str(payload.get("id") or "")
-            session_key = self._slash_confirm_state.pop(confirm_id, None)
-            if not confirm_id or not session_key:
+            callback_id = str(payload.get("id") or "")
+            record = self._slash_confirm_state.get(callback_id)
+            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
+            if not self._valid_callback(record, peer_id, message_id, choice):
                 await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Подтверждение уже обработано или устарело")
                 return
-            label_map = {
-                "once": "✅ Approved once",
-                "always": "🔒 Always approve",
-                "cancel": "❌ Cancelled",
-            }
-            label = label_map.get(choice, "Resolved")
-            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
-            message_id = obj.get("conversation_message_id") or obj.get("message_id") or obj.get("cmid")
-            if message_id:
-                await self._edit_project_text(peer_id, f"cmid:{message_id}", label, keyboard=self._empty_inline_keyboard())
+            # Ack before a potentially slow command handler or VK edit. Do not
+            # claim approval before the core verifies identity and expiry.
+            self._slash_confirm_state.pop(callback_id, None)
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проверяю подтверждение…")
+            result_text = None
             try:
-                from tools import slash_confirm as _slash_confirm_mod
-
-                result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
-                if result_text:
-                    await self._send_project_text(peer_id, result_text)
+                from tools import slash_confirm
+                with slash_confirm._lock:
+                    current = slash_confirm._pending.get(record["session_key"])
+                    matches = current is record["entry"]
+                # resolve() checks core ID, expiry and pops before its first
+                # await. No UI/network await between identity check and resolve.
+                if matches:
+                    result_text = await slash_confirm.resolve(record["session_key"], record["core_id"], choice)
             except Exception as exc:
                 logger.error("VK: slash-confirm callback failed — %s", _redact_token(str(exc)), exc_info=True)
+            # Core returns None for both stale requests and handlers without a
+            # result; a neutral label avoids inventing an Approved outcome.
+            label = "✓ Ответ обработан" if result_text is not None else "⌛ Подтверждение закрыто или устарело"
+            await self._edit_project_text(peer_id, record["message_id"], label, keyboard=self._empty_inline_keyboard())
+            if result_text:
+                await self._send_project_text(peer_id, result_text)
             return
 
         if await self._handle_clarify_payload(
@@ -1979,6 +1975,7 @@ class VKAdapter(BasePlatformAdapter):
             return
 
         if payload.get("vkpl") is None:
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Неизвестное действие")
             return
         action = str(payload.get("vkpl") or "")
         if action == "select":
@@ -3352,6 +3349,66 @@ class VKAdapter(BasePlatformAdapter):
 
         return await _retry_vk_transient_once("video upload", op)
 
+    @staticmethod
+    def _callback_record(session_key: str, chat_id: str, message_id: Optional[str],
+                         choices: set[str], **extra: Any) -> dict[str, Any]:
+        return {"session_key": session_key, "peer_id": str(chat_id),
+                "message_id": message_id, "choices": frozenset(choices), **extra}
+
+    @staticmethod
+    def _valid_callback(record: Any, peer_id: str, message_id: Any, choice: str,
+                        *, text_button: bool = False) -> bool:
+        # Text buttons arrive as a NEW user message, whose cmid is not the prompt.
+        return bool(isinstance(record, dict) and record.get("peer_id") == peer_id
+                    and choice in record.get("choices", ())
+                    and record.get("message_id")
+                    and (text_button or record["message_id"] == f"cmid:{message_id}"))
+
+    @staticmethod
+    def _capture_exec_entry(session_key: str, command: str, description: str) -> Any:
+        """Compatibility seam: gateway passes display text, not a request ID.
+
+        Never guess FIFO identity from the session alone. Ambiguous redacted
+        commands must use the gateway's explicit text fallback instead.
+        """
+        from tools import approval
+        from gateway.run import _redact_approval_command
+        with approval._lock:
+            candidates = [entry for entry in approval._gateway_queues.get(session_key, ())
+                          if not entry.event.is_set() and entry.result is None
+                          and _redact_approval_command(entry.data.get("command", "")) == command
+                          and entry.data.get("description", "dangerous command") == description]
+            return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _resolve_exec_entry(record: dict[str, Any], choice: str) -> str:
+        """Resolve only the captured FIFO head, atomically against timeout.
+
+        Older Hermes uses Lock, newer versions may use RLock. Do not call the
+        locking public resolver recursively on Lock (deadlock), or release the
+        lock between checking identity and resolving (wrong-command race).
+        The Lock compatibility branch mirrors the core's single-entry result /
+        event contract; it never grants policy or executes commands itself.
+        """
+        import threading
+        from tools import approval
+        with approval._lock:
+            queue = approval._gateway_queues.get(record["session_key"], [])
+            entry = record["entry"]
+            if not any(item is entry for item in queue) or entry.event.is_set() or entry.result is not None:
+                return "expired"
+            if queue[0] is not entry:
+                return "out_of_order"
+            if isinstance(approval._lock, type(threading.RLock())):
+                count = approval.resolve_gateway_approval(record["session_key"], choice)
+                return "resolved" if count == 1 else "expired"
+            queue.pop(0)
+            if not queue:
+                approval._gateway_queues.pop(record["session_key"], None)
+            entry.result = choice
+            entry.event.set()
+            return "resolved"
+
     def _format_exec_approval(self, command: str, description: str, smart_denied: bool = False) -> str:
         cmd_preview = command if len(command) <= 1500 else command[:1500] + "..."
         text = (
@@ -3361,6 +3418,7 @@ class VKAdapter(BasePlatformAdapter):
         )
         if smart_denied:
             text += "\n\nSmart DENY: owner override applies to this one operation only."
+        text += "\n\nButtons unavailable? Reply to this prompt with /approve or /deny in the original chat/project lane. /approve resolves the oldest pending command; check earlier prompts first."
         return text
 
     async def send_exec_approval(
@@ -3382,8 +3440,16 @@ class VKAdapter(BasePlatformAdapter):
         if not self.token:
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
         try:
-            self._approval_counter += 1
-            approval_id = self._approval_counter
+            import secrets
+            entry = self._capture_exec_entry(session_key, command, description)
+            if entry is None:
+                return SendResult(success=False, error="Cannot safely identify approval; use text fallback")
+            approval_id = secrets.token_urlsafe(18)
+            allowed_choices = {"once", "deny"}
+            if allow_session and not smart_denied:
+                allowed_choices.add("session")
+                if allow_permanent:
+                    allowed_choices.add("always")
             params = {
                 "peer_ids": str(chat_id),
                 "message": self.format_message(self._format_exec_approval(command, description, smart_denied)),
@@ -3397,7 +3463,10 @@ class VKAdapter(BasePlatformAdapter):
             }
             payload = await self._vk_method("messages.send", params)
             message_id = self._sent_message_id(payload)
-            self._approval_state[approval_id] = session_key
+            if not message_id or not message_id.startswith("cmid:"):
+                return SendResult(success=False, error="Approval prompt message ID unavailable; use text fallback")
+            self._approval_state[approval_id] = self._callback_record(
+                session_key, chat_id, message_id, allowed_choices, entry=entry)
             thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
             if thread_id and message_id:
                 await self._remember_message_lane(str(chat_id), message_id, thread_id)
@@ -3418,16 +3487,28 @@ class VKAdapter(BasePlatformAdapter):
         if not self.token:
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
         try:
+            import secrets
+            from tools import slash_confirm
+            with slash_confirm._lock:
+                entry = slash_confirm._pending.get(session_key)
+                if not entry or entry.get("confirm_id") != confirm_id:
+                    return SendResult(success=False, error="Confirmation unavailable; use text fallback")
+            callback_id = secrets.token_urlsafe(18)
             prompt = f"{title}\n\n{message}" if title else message
+            prompt += "\n\nButtons unavailable? Reply to this prompt with /approve, /always or /cancel in the original chat/project lane."
             params = {
                 "peer_ids": str(chat_id),
                 "message": self.format_message(prompt),
                 "random_id": random.randint(1, 2_147_483_647),
-                "keyboard": self._slash_confirm_keyboard(confirm_id),
+                "keyboard": self._slash_confirm_keyboard(callback_id),
             }
             payload = await self._vk_method("messages.send", params)
             message_id = self._sent_message_id(payload)
-            self._slash_confirm_state[str(confirm_id)] = session_key
+            if not message_id or not message_id.startswith("cmid:"):
+                return SendResult(success=False, error="Confirmation prompt message ID unavailable; use text fallback")
+            self._slash_confirm_state[callback_id] = self._callback_record(
+                session_key, chat_id, message_id, {"once", "always", "cancel"},
+                core_id=confirm_id, entry=entry)
             thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
             if thread_id and message_id:
                 await self._remember_message_lane(str(chat_id), message_id, thread_id)
@@ -3459,17 +3540,28 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
 
         try:
+            import secrets
+            from tools import clarify_gateway
+            with clarify_gateway._lock:
+                entry = clarify_gateway._entries.get(clarify_id)
+                if not entry or entry.session_key != session_key or list(entry.choices or []) != list(choices):
+                    return SendResult(success=False, error="Question unavailable; use text fallback")
+            callback_id = secrets.token_urlsafe(18)
             option_lines = "\n".join(f"{idx + 1}. {choice}" for idx, choice in enumerate(choices))
             message = f"❓ {question}\n\n{option_lines}"
             params = {
                 "peer_ids": str(chat_id),
                 "message": self.format_message(message),
                 "random_id": random.randint(1, 2_147_483_647),
-                "keyboard": self._clarify_keyboard(str(clarify_id), choices),
+                "keyboard": self._clarify_keyboard(callback_id, choices),
             }
             payload = await self._vk_method("messages.send", params)
             message_id = self._sent_message_id(payload)
-            self._clarify_state[str(clarify_id)] = session_key
+            if not message_id or not message_id.startswith("cmid:"):
+                return SendResult(success=False, error="Question prompt message ID unavailable; use text fallback")
+            self._clarify_state[callback_id] = self._callback_record(
+                session_key, chat_id, message_id, {str(i) for i in range(len(choices))} | {"other"},
+                core_id=clarify_id, entry=entry, answers=tuple(str(c) for c in choices))
             thread_id = (metadata or {}).get("thread_id") if isinstance(metadata, dict) else None
             if thread_id and message_id:
                 await self._remember_message_lane(str(chat_id), message_id, thread_id)

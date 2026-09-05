@@ -39,7 +39,7 @@ ctx.register_platform(
 
 ```text
 VK Group Long Poll
-  -> message_new or message_edit event
+  -> message_new / message_edit messages or message_event callbacks
   -> VKAdapter parses peer_id / from_id / text / attachments
   -> adapter allowlist check
   -> optional project-lane routing
@@ -119,10 +119,16 @@ Outbound remote image URLs are sent as text URLs. Local image files use the VK m
 From this plugin repository, use:
 
 ```bash
-python -m pytest tests/test_vk_adapter.py
+python -m pytest tests/
 ```
 
-From a Hermes source checkout, you can also run the copied tests with Hermes' wrapper after setting `PYTHONPATH` to include this plugin directory if needed.
+When a Hermes source checkout is available, use its canonical isolated runner against this repository's actual tests (not an old copied test file):
+
+```bash
+scripts/run_tests.sh /path/to/hermes-vk-platform/tests/
+```
+
+The adapter tests load this repository's adapter directly while using the installed Hermes gateway contracts.
 
 The tests must not require live VK credentials or network access. Mock `_vk_method`, `_download_attachment_async`, and `_multipart_upload_async` for behavior checks.
 
@@ -132,7 +138,7 @@ Run:
 
 ```bash
 python -m py_compile adapter.py setup_helper.py __init__.py
-python -m pytest tests/test_vk_adapter.py
+python -m pytest tests/
 ```
 
 Then scan for private values:

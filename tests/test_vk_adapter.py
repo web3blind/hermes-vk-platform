@@ -2458,7 +2458,7 @@ async def test_vk_send_clarify_renders_numbered_buttons_and_remembers_lane(monke
     labels = [button["action"]["label"] for row in keyboard["buttons"] for button in row]
     assert labels == ["1", "2", "3", "✏️ Свой ответ"]
     action_types = [button["action"]["type"] for row in keyboard["buttons"] for button in row]
-    assert action_types == ["text", "text", "text", "text"]
+    assert action_types == ["callback", "callback", "callback", "callback"]
     payloads = [json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row]
     assert [payload["vkcl"] for payload in payloads] == ["0", "1", "2", "other"]
     assert len({payload["id"] for payload in payloads}) == 1

@@ -1650,7 +1650,7 @@ class VKAdapter(BasePlatformAdapter):
             row.append(
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": str(idx + 1),
                         "payload": json.dumps({"vkcl": str(idx), "id": clarify_id}, ensure_ascii=False),
                     }
@@ -1662,7 +1662,7 @@ class VKAdapter(BasePlatformAdapter):
         row.append(
             {
                 "action": {
-                    "type": "text",
+                    "type": "callback",
                     "label": "✏️ Свой ответ",
                     "payload": json.dumps({"vkcl": "other", "id": clarify_id}, ensure_ascii=False),
                 }

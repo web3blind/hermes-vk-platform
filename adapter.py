@@ -1685,7 +1685,7 @@ class VKAdapter(BasePlatformAdapter):
             {
                 "one_time": False,
                 "inline": True,
-                "buttons": [[{"action": {"type": "text", "label": label, "payload": payload}}]],
+                "buttons": [[{"action": {"type": "callback", "label": label, "payload": payload}}]],
             },
             ensure_ascii=False,
         )
@@ -1735,27 +1735,27 @@ class VKAdapter(BasePlatformAdapter):
                 "/project off — выйти из проектного режима",
                 "/new — новая сессия текущего проекта; если проект не выбран, новая сессия всего VK-чата",
                 "/invite — актуальный инвайт в текущий VK-чат",
-                "Кнопки ниже кликабельные: нажми команду, и VK отправит её в чат.",
+                "Кнопки ниже выполняют команды без отправки текста в чат.",
             ]
         )
 
     def _project_commands_keyboard(self) -> str:
         rows = [
             [
-                {"action": {"type": "text", "label": "/project", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project"}, ensure_ascii=False)}},
-                {"action": {"type": "text", "label": "/project list", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project list"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project list", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project list"}, ensure_ascii=False)}},
             ],
             [
-                {"action": {"type": "text", "label": "/project new", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project new"}, ensure_ascii=False)}},
-                {"action": {"type": "text", "label": "/project edit", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project edit"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project new", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project new"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project edit", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project edit"}, ensure_ascii=False)}},
             ],
             [
-                {"action": {"type": "text", "label": "/project pin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project pin"}, ensure_ascii=False)}},
-                {"action": {"type": "text", "label": "/project unpin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project unpin"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project pin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project pin"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project unpin", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project unpin"}, ensure_ascii=False)}},
             ],
             [
-                {"action": {"type": "text", "label": "/project off", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project off"}, ensure_ascii=False)}},
-                {"action": {"type": "text", "label": "/invite", "payload": json.dumps({"vkpl": "cmd", "cmd": "/invite"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/project off", "payload": json.dumps({"vkpl": "cmd", "cmd": "/project off"}, ensure_ascii=False)}},
+                {"action": {"type": "callback", "label": "/invite", "payload": json.dumps({"vkpl": "cmd", "cmd": "/invite"}, ensure_ascii=False)}},
             ],
         ]
         return json.dumps({"one_time": False, "inline": True, "buttons": rows}, ensure_ascii=False)
@@ -1776,7 +1776,7 @@ class VKAdapter(BasePlatformAdapter):
         row: list[dict[str, Any]] = []
         for lane in visible:
             payload = json.dumps({"vkpl": "select", "id": lane["id"]}, ensure_ascii=False)
-            row.append({"action": {"type": "text", "label": _sanitize_lane_label(lane.get("name"), 40), "payload": payload}})
+            row.append({"action": {"type": "callback", "label": _sanitize_lane_label(lane.get("name"), 40), "payload": payload}})
             if len(row) == 4:
                 rows.append(row)
                 row = []
@@ -1787,7 +1787,7 @@ class VKAdapter(BasePlatformAdapter):
             nav.append(
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": "Предыдущая",
                         "payload": json.dumps({"vkpl": "page", "p": page - 1, "cmd": f"/project list {page}"}, ensure_ascii=False),
                     }
@@ -1797,7 +1797,7 @@ class VKAdapter(BasePlatformAdapter):
             nav.append(
                 {
                     "action": {
-                        "type": "text",
+                        "type": "callback",
                         "label": "Следующая",
                         "payload": json.dumps({"vkpl": "page", "p": page + 1, "cmd": f"/project list {page + 2}"}, ensure_ascii=False),
                     }
@@ -2039,23 +2039,42 @@ class VKAdapter(BasePlatformAdapter):
             if not lane:
                 await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект не найден")
                 return
+            # Freeze routing before the first VK await: callbacks run alongside
+            # ordinary intake, which may capture the active lane during the ACK.
             await self._set_active_lane_id(peer_id, user_id, lane["id"])
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект выбран")
             await self._send_project_text(
                 peer_id,
                 f"Проект выбран: {lane['name']}\n\nГде остановились:\n— пока нет истории\n\nПиши задачу. /new начнёт новую сессию внутри этого проекта.",
-                keyboard=self._project_keyboard(),
+                keyboard=self._project_selected_keyboard(peer_id, lane["id"]),
             )
-            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект выбран")
+            return
+        if action in {"pin", "unpin"}:
+            lane = self._resolve_lane(peer_id, str(payload.get("id") or ""))
+            if not lane:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Проект не найден")
+                return
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Обрабатываю…")
+            await self._handle_project_command(peer_id, user_id, f"/project {action} {lane['id']}")
             return
         if action == "page":
-            page = int(payload.get("p") or 0)
+            raw_page = payload.get("p")
+            try:
+                if isinstance(raw_page, bool) or not isinstance(raw_page, (int, str)):
+                    raise ValueError("invalid project page")
+                page = int(raw_page)
+            except (TypeError, ValueError):
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректная страница")
+                return
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Открываю список…")
             await self._send_or_edit_project_list(peer_id, user_id, page, prefer_edit=True)
             return
         if action == "commands":
-            await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
             await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Команды")
+            await self._send_project_text(peer_id, self._project_commands_text(), keyboard=self._project_commands_keyboard())
             return
         if action == "cmd":
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Выполняю команду…")
             command = str(payload.get("cmd") or "").strip()
             if command == "/invite":
                 await self._handle_invite_command(peer_id, command)
@@ -2064,6 +2083,7 @@ class VKAdapter(BasePlatformAdapter):
             return
         if action == "new":
             await self._set_pending_create(peer_id, user_id)
+            await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Новый проект")
             await self._send_project_text(peer_id, _project_create_prompt_text(), keyboard=self._project_cancel_keyboard())
             return
         if action == "cancel":

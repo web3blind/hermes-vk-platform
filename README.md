@@ -33,7 +33,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Hermes Agent with plugin support.
 - A VK community/group.
 - Community messages enabled in VK.
-- VK Group Long Poll API enabled for `message_new` events.
+- VK Group Long Poll API enabled for `message_new`, `message_edit` and `message_event` (callback buttons).
 - A VK community access token with `messages` permission.
 
 ## Install
@@ -72,7 +72,8 @@ If you prefer manual setup, edit `~/.hermes/.env` as shown below.
      set **Возможности ботов** to enabled and enable **Разрешать добавлять сообщество в чаты**.
 4. Enable Long Poll API for the community.
 5. Enable the `message_new`, `message_edit`, and **`message_event`** event types.
-   `message_event` delivers callback button clicks, including Allow Once / Deny and slash-command confirmations. Without it, buttons can appear but never reach Hermes; message-history fallback cannot recover these clicks.
+   `message_event` delivers callback button clicks: Allow Once / Deny, slash-command confirmations, clarification choices (including Other), and inline project selection, pagination, pin/unpin and command buttons. Without it, buttons can appear but never reach Hermes; message-history fallback cannot recover these clicks.
+   The persistent menu next to the message input remains a text keyboard. Typed commands and replies remain supported. After updating the plugin, restart the gateway and request a fresh keyboard: buttons in older messages keep their original action type.
 6. Create a community token with `messages` permission.
 7. If using group conversations, allow adding the community bot to chats and add it to the target chat.
 8. Configure allowlists before starting the gateway.

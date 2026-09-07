@@ -1889,7 +1889,7 @@ async def test_project_text_button_selects_lane_without_agent_turn(monkeypatch, 
     assert any("Проект выбран: TCCC AI" in params.get("message", "") for method, params in calls if method == "messages.send")
 
 
-def test_project_list_inline_text_keyboard_keeps_visible_labels_without_color(monkeypatch, tmp_path):
+def test_project_list_inline_callback_keyboard_keeps_visible_labels_without_color(monkeypatch, tmp_path):
     monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
     adapter = VKAdapter(
         PlatformConfig(
@@ -1908,15 +1908,22 @@ def test_project_list_inline_text_keyboard_keeps_visible_labels_without_color(mo
     project_button = next(button for button in flat_buttons if button["action"].get("label") == "TCCC AI")
 
     assert keyboard["inline"] is True
-    assert project_button["action"]["type"] == "text"
+    assert project_button["action"]["type"] == "callback"
     assert json.loads(project_button["action"]["payload"])["id"] == "tccc-ai"
     assert all("color" not in button for button in flat_buttons)
+    for raw in (adapter._project_commands_keyboard(), adapter._project_selected_keyboard("2000000042", "tccc-ai")):
+        inline = json.loads(raw)
+        assert inline["inline"] is True
+        assert all(button["action"]["type"] == "callback" for row in inline["buttons"] for button in row)
+    persistent = json.loads(adapter._project_keyboard())
+    assert persistent["inline"] is False
+    assert all(button["action"]["type"] == "text" for row in persistent["buttons"] for button in row)
     resolved = adapter._resolve_lane("2000000042", "TCCC AI")
     assert resolved is not None
     assert resolved["id"] == "tccc-ai"
 
 
-def test_project_list_keyboard_shows_twenty_projects_without_callback_pagination(monkeypatch, tmp_path):
+def test_project_list_keyboard_paginates_twenty_projects_with_callbacks(monkeypatch, tmp_path):
     monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
     lanes = [{"id": "hermes-vk-plugin", "name": "Hermes VK-плагин"}]
     lanes.extend({"id": f"project-{i}", "name": f"Project {i}"} for i in range(19))
@@ -1939,7 +1946,7 @@ def test_project_list_keyboard_shows_twenty_projects_without_callback_pagination
     assert next_payload["cmd"] == "/project list 2"
     assert len(flat_buttons) == 9
     assert len(keyboard["buttons"]) <= 3
-    assert all(button["action"]["type"] == "text" for button in flat_buttons)
+    assert all(button["action"]["type"] == "callback" for button in flat_buttons)
 
     page_two = json.loads(adapter._project_list_keyboard("2000000042", page=1))
     page_two_labels = [button["action"].get("label") for row in page_two["buttons"] for button in row]
@@ -2249,6 +2256,8 @@ async def test_project_message_event_select_sets_active_lane_without_agent_dispa
 
     async def fake_vk_method(method, params=None, **_kwargs):
         calls.append((method, params or {}))
+        if method == "messages.sendMessageEventAnswer":
+            calls[-1][1]["active_lane_at_ack"] = adapter._get_active_lane_id("2000000042", "100")
         return {"response": [{"conversation_message_id": 1}]}
 
     adapter._vk_method = fake_vk_method
@@ -2269,7 +2278,140 @@ async def test_project_message_event_select_sets_active_lane_without_agent_dispa
     await drain_intake(adapter)
     adapter.handle_message.assert_not_awaited()
     assert adapter._get_active_lane_id("2000000042", "100") == "tccc-ai"
-    assert any(call[0] == "messages.sendMessageEventAnswer" for call in calls)
+    assert calls[0][0] == "messages.sendMessageEventAnswer"
+    assert calls[0][1]["active_lane_at_ack"] == "tccc-ai"
+    assert sum(method == "messages.sendMessageEventAnswer" for method, _ in calls) == 1
+    sent = next(params for method, params in calls if method == "messages.send")
+    assert "Проект выбран: TCCC AI" in sent["message"]
+    assert "Где остановились" in sent["message"]
+    assert sent["keyboard"] == adapter._project_selected_keyboard("2000000042", "tccc-ai")
+
+
+@pytest.fixture
+def project_callback_adapter(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={
+        "group_id": "123456789", "allowed_peers": ["2000000042"],
+        "project_lanes": {"2000000042": {"lanes": [
+            {"id": f"project-{i}", "name": f"Project {i}"} for i in range(20)
+        ]}},
+    }))
+    calls = []
+
+    async def fake_vk_method(method, params=None, **_kwargs):
+        calls.append((method, params or {}))
+        if method == "messages.getInviteLink":
+            return {"response": {"link": "https://vk.me/join/test"}}
+        return {"response": [{"conversation_message_id": 77}]}
+
+    adapter._vk_method = fake_vk_method
+    adapter.handle_message = AsyncMock()
+    return adapter, calls
+
+
+async def click_project_callback(adapter, payload):
+    await adapter._handle_update({"type": "message_event", "object": {
+        "peer_id": 2000000042, "user_id": 100, "event_id": "project-event",
+        "conversation_message_id": 77, "payload": payload,
+    }})
+    await drain_intake(adapter)
+    adapter.handle_message.assert_not_awaited()
+
+
+def assert_project_callback_ack(calls):
+    assert calls[0][0] == "messages.sendMessageEventAnswer"
+    answers = [params for method, params in calls if method == "messages.sendMessageEventAnswer"]
+    assert len(answers) == 1
+    assert answers[0]["event_id"] == "project-event"
+    assert answers[0]["user_id"] == "100"
+    assert answers[0]["peer_id"] == "2000000042"
+
+
+@pytest.mark.asyncio
+async def test_project_callback_pin_unpin_targets_button_lane(project_callback_adapter):
+    adapter, calls = project_callback_adapter
+    await adapter._set_active_lane_id("2000000042", "100", "project-1")
+    for action, pinned in (("pin", True), ("unpin", False)):
+        calls.clear()
+        keyboard = json.loads(adapter._project_selected_keyboard("2000000042", "project-0"))
+        button = keyboard["buttons"][0][0]["action"]
+        assert button["type"] == "callback"
+        payload = json.loads(button["payload"])
+        assert payload == {"vkpl": action, "id": "project-0"}
+        await click_project_callback(adapter, payload)
+        assert adapter._is_pinned_lane("2000000042", "project-0") is pinned
+        assert adapter._get_active_lane_id("2000000042", "100") == "project-1"
+        assert_project_callback_ack(calls)
+        assert any("Project 0" in params.get("message", "") for method, params in calls if method == "messages.send")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", [0, 1])
+async def test_project_callback_page_edits_list_and_acks(project_callback_adapter, page):
+    adapter, calls = project_callback_adapter
+    await adapter._send_or_edit_project_list("2000000042", "100", 1 - page)
+    calls.clear()
+    keyboard = json.loads(adapter._project_list_keyboard("2000000042", page=1 - page))
+    payload = next(json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row
+                   if json.loads(button["action"]["payload"]).get("p") == page)
+    await click_project_callback(adapter, payload)
+    assert_project_callback_ack(calls)
+    assert adapter._lane_state["project_list_pages"][adapter._state_key("2000000042", "100")] == page
+    edited = next(params for method, params in calls if method == "messages.edit")
+    assert edited["conversation_message_id"] == "77"
+    assert edited["keyboard"] == adapter._project_list_keyboard("2000000042", page=page)
+    assert not any(method == "messages.send" for method, _ in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page", ["oops", {}, [], None, True, 1.5])
+async def test_project_callback_page_rejects_malformed_payload(project_callback_adapter, page):
+    adapter, calls = project_callback_adapter
+    # Call directly so the intake safety wrapper cannot hide conversion errors.
+    await adapter._handle_message_event_update({"object": {
+        "peer_id": 2000000042, "user_id": 100, "event_id": "project-event",
+        "payload": {"vkpl": "page", "p": page},
+    }})
+    assert_project_callback_ack(calls)
+    assert len(calls) == 1
+    assert "Некоррект" in json.loads(calls[0][1]["event_data"])["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command, expected", [
+    ("/project", "Текущий проект"), ("/project list", "Выберите проект"),
+    ("/project new", "Название"), ("/project edit", "Project 0"),
+    ("/project pin", "закреплён"), ("/project unpin", "откреплён"),
+    ("/project off", "отключён"), ("/invite", "https://vk.me/join/test"),
+])
+async def test_project_callback_command_buttons_ack_before_work(project_callback_adapter, command, expected):
+    adapter, calls = project_callback_adapter
+    await adapter._set_active_lane_id("2000000042", "100", "project-0")
+    keyboard = json.loads(adapter._project_commands_keyboard())
+    payload = next(json.loads(button["action"]["payload"]) for row in keyboard["buttons"] for button in row
+                   if button["action"]["label"] == command)
+    await click_project_callback(adapter, payload)
+    assert_project_callback_ack(calls)
+    assert any(expected in params.get("message", "") for method, params in calls if method == "messages.send")
+    if command == "/project new":
+        assert adapter._pending_create("2000000042", "100")
+    elif command == "/project off":
+        assert adapter._get_active_lane_id("2000000042", "100") is None
+    elif command in {"/project pin", "/project unpin"}:
+        assert adapter._is_pinned_lane("2000000042", "project-0") is (command == "/project pin")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["new", "commands", "cancel"])
+async def test_project_callback_controls_ack_before_response(project_callback_adapter, action):
+    adapter, calls = project_callback_adapter
+    await click_project_callback(adapter, {"vkpl": action})
+    assert_project_callback_ack(calls)
+    if action == "new":
+        assert adapter._pending_create("2000000042", "100")
+    elif action == "commands":
+        sent = next(params for method, params in calls if method == "messages.send")
+        assert sent["keyboard"] == adapter._project_commands_keyboard()
 
 
 @pytest.mark.asyncio

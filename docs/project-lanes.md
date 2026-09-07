@@ -136,7 +136,7 @@ Text commands:
 /commands
 ```
 
-Project list buttons are VK `text` buttons, not callback-only buttons. Do not rely only on visual UI: every action needs a text fallback.
+Inline project list, pagination, pin/unpin and command buttons use VK `callback` actions; enable Long Poll `message_event` to receive clicks. The persistent input menu remains a VK `text` keyboard. Every action also retains a typed command fallback: project selection is not callback-only, and old text-button payloads remain supported. Do not rely only on visual UI.
 
 ## Sorting
 

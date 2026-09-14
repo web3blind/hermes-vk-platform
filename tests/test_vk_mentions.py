@@ -441,4 +441,3 @@ def test_invalid_patterns_fail_safely(patterns):
     adapter = VKAdapter(PlatformConfig(enabled=True, extra={
         "require_mention": True, "mention_patterns": patterns}))
     assert len(adapter._mention_patterns) == (1 if isinstance(patterns, list) and NAME in patterns else 0)
-

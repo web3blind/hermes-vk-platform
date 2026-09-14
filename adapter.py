@@ -897,6 +897,20 @@ class VKAdapter(BasePlatformAdapter):
         self.user_token = os.getenv("VK_USER_TOKEN") or os.getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
+        # Global VK group invocation policy, opt-in; never an authorization grant.
+        self.require_mention = _truthy(extra.get("require_mention"))
+        self._mention_patterns: list[re.Pattern] = []
+        patterns = extra.get("mention_patterns") or []
+        if not isinstance(patterns, (list, tuple)):
+            logger.warning("VK: mention_patterns must be a list of regex strings")
+            patterns = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                self._mention_patterns.append(re.compile(pattern, re.IGNORECASE))
+            except re.error:
+                logger.warning("VK: invalid mention pattern ignored")
 
         self.allowed_users = _split_csv(os.getenv("VK_ALLOWED_USERS") or extra.get("allowed_users"))
         self.allowed_peers = _split_csv(os.getenv("VK_ALLOWED_PEERS") or extra.get("allowed_peers"))
@@ -1525,13 +1539,14 @@ class VKAdapter(BasePlatformAdapter):
             logger.warning("VK: failed to persist project lane state — %s", _redact_token(str(exc)))
         return True
 
-    def _pending_create(self, peer_id: str, user_id: str) -> dict[str, Any] | None:
+    def _pending_create(self, peer_id: str, user_id: str, *, prune: bool = True) -> dict[str, Any] | None:
         pending = self._lane_state.get("pending_create") or {}
         item = pending.get(self._state_key(peer_id, user_id))
         if not isinstance(item, dict):
             return None
         if float(item.get("expires_at") or 0) < time.time():
-            pending.pop(self._state_key(peer_id, user_id), None)
+            if prune:
+                pending.pop(self._state_key(peer_id, user_id), None)
             return None
         return item
 
@@ -1551,17 +1566,19 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("VK: failed to persist project create state — %s", _redact_token(str(exc)))
 
-    def _pending_edit(self, peer_id: str, user_id: str) -> dict[str, Any] | None:
+    def _pending_edit(self, peer_id: str, user_id: str, *, prune: bool = True) -> dict[str, Any] | None:
         pending = self._lane_state.get("pending_edit") or {}
         item = pending.get(self._state_key(peer_id, user_id))
         if not isinstance(item, dict):
             return None
         if float(item.get("expires_at") or 0) < time.time():
-            pending.pop(self._state_key(peer_id, user_id), None)
+            if prune:
+                pending.pop(self._state_key(peer_id, user_id), None)
             return None
         lane_id = str(item.get("lane_id") or "")
         if not lane_id or not self._resolve_lane(peer_id, lane_id):
-            pending.pop(self._state_key(peer_id, user_id), None)
+            if prune:
+                pending.pop(self._state_key(peer_id, user_id), None)
             return None
         return item
 
@@ -2237,7 +2254,7 @@ class VKAdapter(BasePlatformAdapter):
     async def _handle_invite_command(self, peer_id: str, text: str) -> bool:
         if text.strip().lower() != "/invite":
             return False
-        if not str(peer_id).startswith("200000"):
+        if not self._is_group_peer(peer_id):
             await self._send_project_text(peer_id, "Команда /invite работает только в VK-чате, не в личном диалоге.")
             return True
         try:
@@ -2482,6 +2499,110 @@ class VKAdapter(BasePlatformAdapter):
             if not self._intake_closing:
                 await self._handle_message_update(update)
 
+    def _select_message_lane(self, peer_id: str, user_id: str, msg: dict[str, Any],
+                             text: str, has_media: bool) -> tuple[dict[str, Any] | None, str]:
+        """Read-only routing shared by the early clarify gate and normal intake."""
+        reply_lane = self._reply_lane(peer_id, msg)
+        pending_edit = self._pending_edit(peer_id, user_id, prune=False)
+        one_shot, stripped = self._one_shot_lane_for_text(peer_id, text)
+        if reply_lane:
+            return reply_lane, text
+        if pending_edit:
+            return self._resolve_lane(peer_id, str(pending_edit.get("lane_id") or "")), text
+        if one_shot and (stripped or has_media):
+            return one_shot, stripped if stripped else text
+        active = self._get_active_lane_id(peer_id, user_id)
+        return self._resolve_lane(peer_id, active) if active else None, text
+
+    @staticmethod
+    def _is_group_peer(peer_id: str) -> bool:
+        try:
+            return int(peer_id) >= 2000000000
+        except (ValueError, TypeError):
+            return False
+
+    def _passes_invocation_gate(self, msg: dict[str, Any], peer_id: str, user_id: str) -> bool | MessageEvent:
+        """Call ONLY after the parent ACL. Inspect raw text, never quoted summaries.
+
+        Only stop, pending approvals and existing buttons bypass addressing.
+        Busy state alone is not a wake
+        signal; free-text exceptions require an exact-session pending control.
+        No API, session creation or persisted state writes are allowed here.
+        """
+        if not self.require_mention or not self._is_group_peer(peer_id):
+            return True
+        text = str(msg.get("text") or "").strip()
+        command = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
+        if command == "/stop":
+            return True
+        reply = msg.get("reply_message")
+        if self.group_id:
+            if isinstance(reply, dict) and str(reply.get("from_id")) == f"-{self.group_id}":
+                return True
+            identity = re.escape(self.group_id)
+            if re.search(rf"(?<!\w)@club{identity}\b|\[club{identity}\|[^\]]+\]", text, re.IGNORECASE):
+                return True
+        if any(pattern.search(text) for pattern in self._mention_patterns):
+            return True
+        payload = msg.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (ValueError, TypeError):
+                payload = {}
+        if isinstance(payload, dict):
+            # Existing handlers validate choice/nonce/peer/prompt before resolving.
+            if payload.get("vkcl") is not None:
+                return True
+            action = payload.get("vkpl")
+            if not isinstance(action, str):
+                action = ""
+            if action == "cancel" and text.lower() in {"отмена", "cancel"}:
+                return bool(self._pending_create(peer_id, user_id, prune=False)
+                            or self._pending_edit(peer_id, user_id, prune=False))
+            if action == "cmd":
+                return bool(str(payload.get("cmd") or "").strip())
+            if action in {"list", "menu", "new", "page", "commands", "new_session"}:
+                return True
+            if action in {"select", "pin", "unpin"} and self._resolve_lane(peer_id, str(payload.get("id") or "")):
+                return True
+        if command and command not in {"/approve", "/deny"}:
+            return False
+        if not text or (not command and (msg.get("attachments") or msg.get("fwd_messages"))):
+            return False
+        try:
+            from tools.clarify_gateway import has_pending
+            lane, routed_text = self._select_message_lane(peer_id, user_id, msg, text, False)
+            source = self.build_source(
+                chat_id=peer_id, chat_type="thread" if lane else "group", user_id=user_id,
+                thread_id=f"{LANE_THREAD_PREFIX}{lane['id']}" if lane else None,
+            )
+            if getattr(source, "profile_route_rejected", False):
+                return False
+            event = MessageEvent(text=routed_text, message_type=MessageType.TEXT, source=source)
+            # Freeze the checked route and answer: project-name parsing and API
+            # enrichment must not consume or redirect a clarification response.
+            key = self._event_session_key(event)
+            if not command and has_pending(key):
+                return event
+            # Match the core's exact bare-word approval vocabulary, and only
+            # while THIS routed session has a blocking approval. Synthesize the
+            # same slash control so it bypasses media and base busy guards;
+            # the core still owns authorization and actual queue resolution.
+            from tools.approval import has_blocking_approval
+            from gateway.run_busy import GatewayBusySessionMixin
+            if command:
+                return event if has_blocking_approval(key) else False
+            choice = GatewayBusySessionMixin._PLAINTEXT_APPROVAL_WORDS.get(routed_text.lower())
+            if choice and has_blocking_approval(key):
+                command, args = choice
+                event.text = f"/{command} {args}".strip()
+                return event
+            return False
+        except Exception:
+            logger.warning("VK: unable to check pending clarify; requiring an explicit invocation")
+            return False
+
     async def _handle_message_update(self, update: dict[str, Any]) -> None:
         update_type = str(update.get("type") or "")
         obj = update.get("object") or {}
@@ -2500,6 +2621,10 @@ class VKAdapter(BasePlatformAdapter):
             logger.info("VK: ignoring unauthorized sender=%s peer=%s", from_id, peer_id)
             return
 
+        invocation = self._passes_invocation_gate(msg, peer_id, from_id)
+        if not invocation:
+            return
+
         conversation_message_id = msg.get("conversation_message_id") or msg.get("id")
         if update_type == "message_new":
             if self._is_duplicate_event(peer_id=peer_id, conversation_message_id=conversation_message_id):
@@ -2509,6 +2634,11 @@ class VKAdapter(BasePlatformAdapter):
             if self._is_duplicate_edit_event(peer_id=peer_id, conversation_message_id=conversation_message_id, msg=msg):
                 logger.info("VK: ignoring duplicate edit event peer=%s cmid=%s", peer_id, conversation_message_id)
                 return
+        if isinstance(invocation, MessageEvent):
+            invocation.raw_message = update
+            invocation.message_id = str(conversation_message_id) if conversation_message_id else None
+            await self._dispatch_inbound(invocation)
+            return
         msg = await self._enrich_message_from_api(msg, peer_id=peer_id, conversation_message_id=conversation_message_id)
 
         text = str(msg.get("text") or "").strip()
@@ -2602,7 +2732,7 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("VK: project button selection failed safely; falling back to normal message — %s", _redact_token(str(exc)))
 
-        chat_type = "group" if peer_id.startswith("200000") else "dm"
+        chat_type = "group" if self._is_group_peer(peer_id) else "dm"
         chat_name, chat_topic = await self._resolve_conversation_context(peer_id, chat_type=chat_type)
         user_name = f"VK user {from_id}"
 
@@ -2675,22 +2805,8 @@ class VKAdapter(BasePlatformAdapter):
             logger.warning("VK: pending project edit state failed safely — %s", _redact_token(str(exc)))
 
         selected_lane = None
-        one_shot_lane = None
         try:
-            reply_lane = self._reply_lane(peer_id, msg)
-            one_shot_lane, stripped_text = self._one_shot_lane_for_text(peer_id, text)
-            if reply_lane:
-                selected_lane = reply_lane
-            elif pending_edit:
-                selected_lane = self._resolve_lane(peer_id, str(pending_edit.get("lane_id") or ""))
-            elif one_shot_lane and stripped_text:
-                selected_lane = one_shot_lane
-                text = stripped_text
-            elif one_shot_lane and media_urls:
-                selected_lane = one_shot_lane
-            else:
-                active_lane_id = self._get_active_lane_id(peer_id, from_id)
-                selected_lane = self._resolve_lane(peer_id, active_lane_id or "") if active_lane_id else None
+            selected_lane, text = self._select_message_lane(peer_id, from_id, msg, text, bool(media_urls))
         except Exception as exc:
             logger.warning("VK: project lane routing failed safely; using root chat — %s", _redact_token(str(exc)))
             selected_lane = None
@@ -2767,11 +2883,7 @@ class VKAdapter(BasePlatformAdapter):
         """Freeze routing at intake; serialize dispatch, never an agent's lifetime."""
         if self._intake_closing:
             return
-        key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        key = self._event_session_key(event)
         previous = self._intake_tails.get(key)
         # Core owns authorization and resolution of textual controls. Only
         # bypass intake ordering; never resolve a waiter here or bypass core.
@@ -3124,7 +3236,7 @@ class VKAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _vk_web_chat_url(peer_id: str) -> str:
-        if str(peer_id).startswith("200000"):
+        if VKAdapter._is_group_peer(peer_id):
             try:
                 return f"https://vk.com/im?sel=c{int(peer_id) - 2_000_000_000}"
             except ValueError:
@@ -3928,7 +4040,7 @@ class VKAdapter(BasePlatformAdapter):
         return {
             "id": chat_id,
             "name": f"VK peer {chat_id}",
-            "type": "group" if chat_id.startswith("200000") else "dm",
+            "type": "group" if self._is_group_peer(chat_id) else "dm",
             "chat_id": chat_id,
         }
 
@@ -4010,12 +4122,13 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
             extra[key] = value
     if "group_token" in vk_cfg and not getattr(platform_cfg, "token", None):
         platform_cfg.token = str(vk_cfg["group_token"])
-    for key in ("channel_prompts", "channel_skill_bindings"):
+    for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "mention_patterns"):
         value = vk_cfg.get(key)
         if value is not None:
             extra[key] = value
     if isinstance(platforms_vk_extra, dict):
-        for key in ("reactions_enabled", "reaction_progress", "reaction_ok", "reaction_fail"):
+        for key in ("reactions_enabled", "reaction_progress", "reaction_ok", "reaction_fail",
+                    "require_mention", "mention_patterns"):
             if key in platforms_vk_extra:
                 extra[key] = platforms_vk_extra[key]
 

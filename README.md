@@ -151,6 +151,51 @@ peer_id = 2000000000 + chat_id
 
 Example: VK chat id `1` becomes peer id `2000000001`.
 
+### Global group invocation gate (optional)
+
+Off by default. To require an invocation in **all VK group conversations** handled
+by this adapter, add non-secret settings to `config.yaml`:
+
+```yaml
+vk:
+  require_mention: true
+  mention_patterns:
+    - '(?<![\w@])(?:ИИЛада|курсор)\b'
+```
+
+Patterns are Python regular expressions, compiled case-insensitively with Unicode
+word boundaries. This example accepts `КУРСОР: помоги` and `ИИЛада?`, not
+`суперкурсор`, `курсорный`, `ИИЛада2`, `ИИЛада_тест` or `@курсор`.
+Use YAML single quotes to preserve backslashes. Invalid patterns are ignored with
+a warning; a malformed list does not disable the gate. No custom names are
+hardcoded into the plugin.
+
+The same keys are accepted under `gateway.vk` or `platforms.vk.extra` (the latter
+overrides the shorthand). Use one configuration location to avoid ambiguity.
+DMs are unaffected. A direct reply whose raw VK `reply_message.from_id` identifies
+this bot community, or an explicit `@club<ID>` / `[club<ID>|label]` mention, also
+invokes it. Quoted/forwarded text and attachment summaries never supply a trigger.
+If a raw update lacks reply identity, it fails closed rather than fetching history
+to discover a possible invocation.
+
+This gate is **not authorization**: existing sender/peer ACLs run first, including
+per-peer overrides. It adds no global owner-only rule and changes no other chat's
+membership permissions. Restrict a particular chat with `allowed_users_by_peer`,
+not a global user-only policy when other chats must retain their current access.
+
+Non-control slash commands also require a name/native mention or a direct reply
+to this bot (for example, reply `/help` to its message). `/stop` remains available
+without a name; `/approve` and `/deny` bypass addressing only while the exact routed
+session has a blocking approval. Existing button controls remain available.
+Callback nonce, peer, prompt and
+request checks remain in force. The core's exact bare-word approval replies (such
+as `yes` / `no`) are promoted to slash controls only when the exact routed session
+has a blocking approval; the core still authorizes and resolves that request.
+An exact routed-session pending clarification
+accepts an unaddressed text answer; the checked route and answer are preserved
+without API enrichment or project selection. Merely being busy is not an invocation:
+unaddressed conversation is dropped before downloads, reactions or agent dispatch.
+
 ### Unsafe testing mode
 
 Only for isolated test communities:

@@ -99,8 +99,8 @@ def clear_vk_env(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.config.save_config", lambda *_args, **_kwargs: None)
 
 
-@pytest.fixture
-def callback_env(monkeypatch, tmp_path):
+@pytest.fixture(params=[True, False], ids=["persistent-on", "persistent-off"])
+def callback_env(monkeypatch, tmp_path, request):
     from tools import approval, slash_confirm, clarify_gateway
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("plugins.platforms.vk.adapter.get_hermes_home", lambda: tmp_path)
@@ -109,6 +109,7 @@ def callback_env(monkeypatch, tmp_path):
     monkeypatch.setattr(clarify_gateway, "_entries", {})
     monkeypatch.setattr(clarify_gateway, "_session_index", {})
     adapter = VKAdapter(PlatformConfig(enabled=True, token="test-token", extra={
+        "persistent_keyboard_enabled": request.param,
         "group_id": "123", "allowed_peers": ["2000000042", "2000000043"]}))
     calls = []
     async def api(method, params=None, **kwargs):
@@ -131,6 +132,131 @@ def intake_update(cmid, text="hello", *, media=False, peer=2000000042, user=100)
         message["attachments"] = [{"type": "audio_message", "audio_message": {
             "link_ogg": "https://vk.example/voice.ogg"}}]
     return {"type": "message_new", "object": {"message": message}}
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ({}, True),
+    ({"persistent_keyboard_enabled": False}, False),
+    ({"persistent_keyboard_enabled": False, "persistent_keyboard_by_peer": {2000000042: True}}, True),
+    ({"persistent_keyboard_by_peer": {"2000000042": False}}, False),
+    ({"persistent_keyboard_by_peer": {"2000000043": False}}, True),
+    ({"persistent_keyboard_enabled": False, "persistent_keyboard_by_peer": {"2000000042": "true"}}, False),
+    ({"persistent_keyboard_enabled": "false", "persistent_keyboard_by_peer": []}, True),
+])
+@pytest.mark.asyncio
+async def test_persistent_keyboard_policy_send_paths(extra, expected):
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test", extra={
+        "allowed_peers": ["2000000042"], **extra}))
+    adapter._vk_method = AsyncMock(return_value={"response": [{"conversation_message_id": 77}]})
+    assert (await adapter.send("2000000042", "reply")).success
+    assert (await adapter._send_attachment("2000000042", "doc1_2", "caption")).success
+    assert await adapter._handle_project_command("2000000042", "100", "/project")
+    for call in adapter._vk_method.await_args_list:
+        assert ("keyboard" in call.args[1]) is expected
+    adapter._vk_method.reset_mock()
+    assert (await adapter.send("2000000099", "not eligible")).success
+    assert "keyboard" not in adapter._vk_method.await_args.args[1]
+
+
+@pytest.mark.parametrize("root", ["vk", "gateway", "platforms"])
+def test_persistent_keyboard_yaml(root):
+    settings = {"persistent_keyboard_enabled": False,
+                "persistent_keyboard_by_peer": {2000000042: True}}
+    cfg = {"vk": settings} if root == "vk" else (
+        {"gateway": {"vk": settings}} if root == "gateway" else
+        {"platforms": {"vk": {"extra": settings}}})
+    parsed = _apply_yaml_config(cfg, PlatformConfig(enabled=True))
+    assert parsed == settings
+    if root == "platforms":
+        cfg["vk"] = {"persistent_keyboard_enabled": True}
+        assert _apply_yaml_config(cfg, PlatformConfig(enabled=True)) == settings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,payload", [
+    ("Меню", None), ("/project", None), ("/project off", None),
+    ("/project search absent", None),
+    ("button", {"vkpl": "cmd", "cmd": "/project"}),
+    ("button", {"vkpl": "new_session"}),
+])
+async def test_disabled_keyboard_real_intake_and_gateway_reply(text, payload):
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test", extra={
+        "allowed_peers": ["2000000042"], "persistent_keyboard_enabled": False}))
+    adapter._vk_method = AsyncMock(return_value={"response": [{"conversation_message_id": 77}]})
+    events = []
+    async def gateway_sink(event):
+        events.append(event)
+        await adapter.send(event.source.chat_id, "new session reply")
+    adapter.handle_message = gateway_sink
+    update = intake_update(1, text)
+    if payload:
+        update["object"]["message"]["payload"] = json.dumps(payload)
+    await adapter._handle_update(update)
+    await drain_intake(adapter)
+    sends = [c.args[1] for c in adapter._vk_method.await_args_list if c.args[0] == "messages.send"]
+    assert sends
+    assert all("keyboard" not in params for params in sends)
+    if payload and payload["vkpl"] == "new_session":
+        assert [event.text for event in events] == ["/new"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_persistent_keyboard_preserves_explicit_inline(callback_env):
+    adapter, calls, _ = callback_env
+    adapter.config.extra["persistent_keyboard_enabled"] = False
+    # Construct from config, just as a gateway restart does.
+    adapter = VKAdapter(adapter.config)
+    adapter._vk_method = AsyncMock(return_value={"response": [{"conversation_message_id": 77}]})
+    keyboards = [adapter._project_cancel_keyboard(), adapter._project_commands_keyboard(),
+                 adapter._project_list_keyboard("2000000042"),
+                 adapter._project_selected_keyboard("2000000042", "a"),
+                 adapter._exec_approval_keyboard("request", allow_permanent=False, allow_session=False, smart_denied=False),
+                 adapter._slash_confirm_keyboard("confirm"),
+                 adapter._clarify_keyboard("clarify", ["A", "B"])]
+    for keyboard in keyboards:
+        assert json.loads(keyboard)["inline"] is True
+        await adapter._send_project_text("2000000042", "inline", keyboard=keyboard)
+        assert adapter._vk_method.await_args.args[1]["keyboard"] == keyboard
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer", ["2000000042", "100"])
+async def test_persistent_keyboard_override_does_not_grant_access(peer):
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test", extra={
+        "allowed_users": ["999"], "persistent_keyboard_by_peer": {peer: True}}))
+    adapter._vk_method = AsyncMock(return_value={"response": {}})
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_update(intake_update(1, "/project", peer=int(peer)))
+    await drain_intake(adapter)
+    adapter._vk_method.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    assert (await adapter.send(peer, "outbound")).success
+    assert "keyboard" not in adapter._vk_method.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_disabled_keyboard_project_lifecycle():
+    adapter = VKAdapter(PlatformConfig(enabled=True, token="test", extra={
+        "allowed_peers": ["2000000042"],
+        "persistent_keyboard_by_peer": {"2000000042": False}}))
+    adapter._vk_method = AsyncMock(return_value={"response": [{"conversation_message_id": 77}]})
+    commands = ["/project new Alpha coding context", "/project pin", "/project unpin alpha",
+                "/project edit alpha Название: Beta", "/project new", "отмена",
+                "/project edit", "отмена", "/project list", "/commands"]
+    for cmid, command in enumerate(commands, 1):
+        adapter._vk_method.reset_mock()
+        await adapter._handle_update(intake_update(cmid, command))
+        await drain_intake(adapter)
+        sends = [c.args[1] for c in adapter._vk_method.await_args_list if c.args[0] in {"messages.send", "messages.edit"}]
+        assert sends, command
+        for params in sends:
+            if "keyboard" in params:
+                assert json.loads(params["keyboard"])["inline"] is True, command
+    adapter._vk_method.reset_mock()
+    await adapter._handle_update(callback_update({"vkpl": "cmd", "cmd": "/project"}))
+    assert any(c.args[0] == "messages.sendMessageEventAnswer" for c in adapter._vk_method.await_args_list)
+    sends = [c.args[1] for c in adapter._vk_method.await_args_list if c.args[0] == "messages.send"]
+    assert sends and all("keyboard" not in params for params in sends)
 
 
 def intake_adapter():

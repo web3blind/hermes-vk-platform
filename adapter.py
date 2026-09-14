@@ -897,6 +897,14 @@ class VKAdapter(BasePlatformAdapter):
         self.user_token = os.getenv("VK_USER_TOKEN") or os.getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
         self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
         self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
+        # UI-only policy: strict YAML booleans; malformed values inherit defaults.
+        keyboard_enabled = extra.get("persistent_keyboard_enabled", True)
+        self.persistent_keyboard_enabled = keyboard_enabled if isinstance(keyboard_enabled, bool) else True
+        keyboard_by_peer = extra.get("persistent_keyboard_by_peer")
+        self.persistent_keyboard_by_peer = {
+            str(peer): enabled for peer, enabled in keyboard_by_peer.items()
+            if isinstance(enabled, bool)
+        } if isinstance(keyboard_by_peer, dict) else {}
         # Global VK group invocation policy, opt-in; never an authorization grant.
         self.require_mention = _truthy(extra.get("require_mention"))
         self._mention_patterns: list[re.Pattern] = []
@@ -1598,6 +1606,11 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("VK: failed to persist project edit state — %s", _redact_token(str(exc)))
 
+    def _persistent_project_keyboard(self, peer_id: str) -> str | None:
+        """Gate only the technical input menu, never inline interaction controls."""
+        enabled = self.persistent_keyboard_by_peer.get(str(peer_id), self.persistent_keyboard_enabled)
+        return self._project_keyboard() if enabled else None
+
     def _project_keyboard(self) -> str:
         buttons = [
             [{"action": {"type": "text", "label": "Проекты", "payload": json.dumps({"vkpl": "list"}, ensure_ascii=False)}, "color": "secondary"}],
@@ -2123,7 +2136,7 @@ class VKAdapter(BasePlatformAdapter):
                 lane_id = self._get_active_lane_id(peer_id, user_id)
                 lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
                 current = lane.get("name") if lane else "не выбран"
-                await self._send_project_text(peer_id, f"Меню проектов VK\nТекущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._project_keyboard())
+                await self._send_project_text(peer_id, f"Меню проектов VK\nТекущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if not lowered.startswith("/project"):
             if lowered.lower() in {"/commands", "/command", "команды"}:
@@ -2147,7 +2160,7 @@ class VKAdapter(BasePlatformAdapter):
             lane_id = self._get_active_lane_id(peer_id, user_id)
             lane = self._resolve_lane(peer_id, lane_id or "") if lane_id else None
             current = lane.get("name") if lane else "не выбран"
-            await self._send_project_text(peer_id, f"Текущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, f"Текущий проект: {current}\n/project list — список\n/project new — новый проект\n/project edit — изменить текущий проект\n/project edit <id> <что изменить> — быстрое изменение\n/project off — выйти из проекта", keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if args == "list" or re.fullmatch(r"list\s+\d+", args):
             page = 0
@@ -2166,11 +2179,11 @@ class VKAdapter(BasePlatformAdapter):
                 ).lower()
                 if query and query in haystack:
                     matches.append(f"- {lane.get('name')} (`{lane.get('id')}`)")
-            await self._send_project_text(peer_id, "Найденные проекты:\n" + ("\n".join(matches) if matches else "ничего не найдено"), keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, "Найденные проекты:\n" + ("\n".join(matches) if matches else "ничего не найдено"), keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if args == "off":
             await self._set_active_lane_id(peer_id, user_id, None)
-            await self._send_project_text(peer_id, "Проектный режим отключён для тебя в этом чате.", keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, "Проектный режим отключён для тебя в этом чате.", keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if args in {"pin", "unpin"}:
             lane_id = self._get_active_lane_id(peer_id, user_id)
@@ -2180,7 +2193,7 @@ class VKAdapter(BasePlatformAdapter):
                 return True
             pinned = args == "pin"
             await self._set_pinned_lane(peer_id, lane["id"], pinned)
-            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if args.startswith("pin ") or args.startswith("unpin "):
             command, _, target = args.partition(" ")
@@ -2190,7 +2203,7 @@ class VKAdapter(BasePlatformAdapter):
                 return True
             pinned = command == "pin"
             await self._set_pinned_lane(peer_id, lane["id"], pinned)
-            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"], keyboard=self._persistent_project_keyboard(peer_id))
             return True
         if args == "new":
             await self._set_pending_create(peer_id, user_id)
@@ -2208,7 +2221,7 @@ class VKAdapter(BasePlatformAdapter):
             await self._send_project_text(
                 peer_id,
                 "Проект создан и выбран: " + lane["name"] + "\n\n```yaml\n" + _format_lane_yaml_snippet(lane) + "\n```",
-                keyboard=self._project_keyboard(),
+                keyboard=self._persistent_project_keyboard(peer_id),
             )
             return True
         if args == "edit":
@@ -2238,10 +2251,10 @@ class VKAdapter(BasePlatformAdapter):
                 return True
             edited = await self._update_custom_lane(peer_id, lane["id"], updates)
             if not edited:
-                await self._send_project_text(peer_id, "Не удалось обновить проект: данные не прошли проверку.", keyboard=self._project_keyboard())
+                await self._send_project_text(peer_id, "Не удалось обновить проект: данные не прошли проверку.", keyboard=self._persistent_project_keyboard(peer_id))
                 return True
             await self._set_active_lane_id(peer_id, user_id, edited["id"])
-            await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"] + "\n\n```yaml\n" + _format_lane_yaml_snippet(edited) + "\n```", keyboard=self._project_keyboard())
+            await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"] + "\n\n```yaml\n" + _format_lane_yaml_snippet(edited) + "\n```", keyboard=self._persistent_project_keyboard(peer_id))
             return True
         lane = self._resolve_lane(peer_id, args)
         if not lane:
@@ -2716,7 +2729,7 @@ class VKAdapter(BasePlatformAdapter):
                     await self._send_project_text(
                         peer_id,
                         ("Проект закреплён первым в списке: " if pinned else "Проект откреплён: ") + lane["name"],
-                        keyboard=self._project_keyboard(),
+                        keyboard=self._persistent_project_keyboard(peer_id),
                     )
                     return
             elif control_text and not control_text.startswith("/") and not media_urls:
@@ -2744,7 +2757,7 @@ class VKAdapter(BasePlatformAdapter):
                     await self._clear_pending_create(peer_id, from_id)
                     if await self._add_custom_lane(peer_id, parsed_lane):
                         await self._set_active_lane_id(peer_id, from_id, parsed_lane["id"])
-                        await self._send_project_text(peer_id, "Проект создан и выбран: " + parsed_lane["name"], keyboard=self._project_keyboard())
+                        await self._send_project_text(peer_id, "Проект создан и выбран: " + parsed_lane["name"], keyboard=self._persistent_project_keyboard(peer_id))
                         return
                     await self._send_project_text(peer_id, "Не удалось создать проект: id уже занят или данные не прошли проверку.", keyboard=self._project_cancel_keyboard())
                     return
@@ -2761,7 +2774,7 @@ class VKAdapter(BasePlatformAdapter):
                     edited = await self._update_custom_lane(peer_id, lane_id, updates)
                     if edited:
                         await self._set_active_lane_id(peer_id, from_id, edited["id"])
-                        await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"], keyboard=self._project_keyboard())
+                        await self._send_project_text(peer_id, "Проект обновлён: " + edited["name"], keyboard=self._persistent_project_keyboard(peer_id))
                         return
                     await self._send_project_text(peer_id, "Не удалось обновить проект: данные не прошли проверку.", keyboard=self._project_cancel_keyboard())
                     return
@@ -2772,11 +2785,11 @@ class VKAdapter(BasePlatformAdapter):
             wants_cancel = text.strip().lower() in {"отмена", "cancel"}
             if wants_cancel and self._pending_create(peer_id, from_id):
                 await self._clear_pending_create(peer_id, from_id)
-                await self._send_project_text(peer_id, "Создание проекта отменено.", keyboard=self._project_keyboard())
+                await self._send_project_text(peer_id, "Создание проекта отменено.", keyboard=self._persistent_project_keyboard(peer_id))
                 return
             if wants_cancel and self._pending_edit(peer_id, from_id):
                 await self._clear_pending_edit(peer_id, from_id)
-                await self._send_project_text(peer_id, "Редактирование проекта отменено.", keyboard=self._project_keyboard())
+                await self._send_project_text(peer_id, "Редактирование проекта отменено.", keyboard=self._persistent_project_keyboard(peer_id))
                 return
         except Exception as exc:
             logger.warning("VK: pending project cancel failed safely — %s", _redact_token(str(exc)))
@@ -3592,7 +3605,7 @@ class VKAdapter(BasePlatformAdapter):
 
     async def _send_attachment(self, chat_id: str, attachment: str, caption: Optional[str] = None) -> SendResult:
         try:
-            default_keyboard = self._project_keyboard() if self._should_attach_project_keyboard(chat_id) else None
+            default_keyboard = self._persistent_project_keyboard(chat_id) if self._should_attach_project_keyboard(chat_id) else None
 
             async def op():
                 params = {
@@ -3887,7 +3900,7 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
 
         chunks = self.truncate_message(self.format_message(content or ""), self.max_message_length)
-        default_keyboard = self._project_keyboard() if self._should_attach_project_keyboard(chat_id) else None
+        default_keyboard = self._persistent_project_keyboard(chat_id) if self._should_attach_project_keyboard(chat_id) else None
         last_message_id: Optional[str] = None
         continuation_ids: list[str] = []
         try:
@@ -4122,13 +4135,15 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
             extra[key] = value
     if "group_token" in vk_cfg and not getattr(platform_cfg, "token", None):
         platform_cfg.token = str(vk_cfg["group_token"])
-    for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "mention_patterns"):
+    for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "mention_patterns",
+                "persistent_keyboard_enabled", "persistent_keyboard_by_peer"):
         value = vk_cfg.get(key)
         if value is not None:
             extra[key] = value
     if isinstance(platforms_vk_extra, dict):
         for key in ("reactions_enabled", "reaction_progress", "reaction_ok", "reaction_fail",
-                    "require_mention", "mention_patterns"):
+                    "require_mention", "mention_patterns",
+                    "persistent_keyboard_enabled", "persistent_keyboard_by_peer"):
             if key in platforms_vk_extra:
                 extra[key] = platforms_vk_extra[key]
 

@@ -382,7 +382,43 @@ python plugins/platforms/vk/setup_helper.py lanes import --to-peer 2000000001 --
 
 The importer reads Telegram topics from `platforms.telegram.extra.group_topics` and `dm_topics` (optionally filtered by `--telegram-chat-id`), legacy VK lanes from `vk.project_lanes`, and Discord thread mapping sections when present. It writes `platforms.vk.extra.project_lanes.enabled: true` and upserts lanes under `chats.<peer>.lanes`.
 
-For authorized VK chats and DMs, normal adapter replies also attach the persistent command keyboard. This keeps `Проекты / Новый проект / Команды` visible even before the first project exists and after ordinary gateway messages such as `/stop` responses.
+### Persistent technical menu
+
+By default, normal text and attachment replies in already eligible VK chats and DMs
+attach the persistent `Проекты / Новый проект / Команды / Новая сессия` keyboard.
+Eligibility is unchanged: an allowed peer/user ID, home channel, configured project
+peer, or `allow_all_users`. This is a UI convenience, **not an authorization grant**.
+Explicit project-menu responses retain their existing behavior by default.
+
+To hide this menu in one chat without changing permissions or project routing, merge
+these non-secret settings into your existing `config.yaml`:
+
+```yaml
+platforms:
+  vk:
+    extra:
+      persistent_keyboard_enabled: true  # global default; false disables the menu
+      persistent_keyboard_by_peer:
+        "2000000042": false  # hide only in this example conversation
+        "123456789": true   # optional DM override, even if the global default is false
+```
+
+Per-peer values override the global switch. Missing peer entries inherit it; the
+global default is `true`. Use YAML booleans (`true` / `false`), not quoted strings.
+Invalid global values fall back to `true`; invalid overrides are ignored. Numeric
+YAML peer keys are accepted, but quoted IDs are recommended. Setting `true` never
+makes an otherwise ineligible peer receive an automatic keyboard or grants access.
+Legacy `vk` / `gateway.vk` settings are also accepted; canonical
+`platforms.vk.extra` values take precedence.
+
+Disabling applies to **every new attachment of this persistent menu**, including
+project commands, old `cmd` / `new_session` button payloads and their replies.
+It does not disable typed commands, project lanes, ACL checks, invocation rules,
+or inline project lists, command buttons, approvals, confirmations and clarify choices.
+No empty keyboard is sent automatically: VK clients may retain a keyboard already
+shown before the change. Clearing that existing keyboard is a separate explicit
+operator action. Activate configuration changes with your normal gateway restart;
+this setting does not modify running gateway state by itself.
 
 Project lists are sorted by latest Hermes thread-session activity for that VK peer. The most recently used project appears first; lanes without sessions stay below in config order.
 

@@ -8,7 +8,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -779,6 +779,28 @@ async def test_connect_warns_for_missing_callbacks_and_inspection_failure(callba
 
 
 @pytest.mark.asyncio
+async def test_connect_wires_registered_native_handlers(callback_env, monkeypatch):
+    adapter, _calls, _ = callback_env
+    adapter._vk_method = AsyncMock(side_effect=[
+        {"response": {"server": "https://example.test", "key": "test", "ts": "1"}},
+        {"response": {"is_enabled": True, "events": {"message_event": 1}}},
+    ])
+    adapter._poll_loop = AsyncMock()
+    adapter.fallback_poll_enabled = False
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    manager = PluginManager()
+    factory = Mock()
+    ctx = PluginContext(PluginManifest(name="vk-test-handler"), manager)
+    ctx.register_platform_handler("vk", factory)
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda *a, **k: True)
+
+    assert await adapter.connect()
+    factory.assert_called_once_with(None, adapter)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_approval_prompts_include_reply_in_original_lane_text_fallback(callback_env):
     from tools import slash_confirm
     adapter, calls, approval = callback_env
@@ -1076,6 +1098,66 @@ def test_yaml_config_bridges_vk_channel_prompts_and_skill_bindings():
         "channel_prompts": {"2000000042": "family prompt"},
         "channel_skill_bindings": [{"id": "2000000042", "skills": ["perplex"]}],
     }
+
+
+@pytest.mark.parametrize("storage", ["object", "dict"])
+def test_scoped_yaml_config_preserves_env_and_token_storage(monkeypatch, storage):
+    import agent.secret_scope as secrets
+
+    platform_cfg = PlatformConfig(enabled=False) if storage == "object" else {"enabled": False}
+    monkeypatch.setenv("VK_GROUP_TOKEN", "ambient-default-token")
+    monkeypatch.setenv("VK_GROUP_ID", "999")
+    ambient = {key: value for key, value in os.environ.items() if key.startswith("VK_")}
+    old_active = secrets.is_multiplex_active()
+    scope_token = secrets.set_secret_scope({})
+    secrets.set_multiplex_active(True)
+    try:
+        extra = _apply_yaml_config(
+            {"vk": {"group_token": "scoped-yaml-token", "group_id": "200", "allowed_users": ["22"]}},
+            platform_cfg,
+        )
+    finally:
+        secrets.reset_secret_scope(scope_token)
+        secrets.set_multiplex_active(old_active)
+
+    assert {key: value for key, value in os.environ.items() if key.startswith("VK_")} == ambient
+    assert extra["group_token"] == "scoped-yaml-token"
+    assert extra["group_id"] == "200"
+    assert extra["allowed_users"] == ["22"]
+    stored_token = platform_cfg.token if storage == "object" else platform_cfg["token"]
+    assert stored_token == "scoped-yaml-token"
+
+
+@pytest.mark.parametrize("platform_cfg", [PlatformConfig(token="canonical-token"), {"token": "canonical-token"}])
+def test_yaml_group_token_does_not_override_existing_canonical_token(platform_cfg, monkeypatch):
+    monkeypatch.setenv("VK_GROUP_TOKEN", "ambient-token")
+    extra = _apply_yaml_config({"vk": {"group_token": "legacy-token"}}, platform_cfg)
+
+    stored_token = platform_cfg.token if isinstance(platform_cfg, PlatformConfig) else platform_cfg["token"]
+    assert stored_token == "canonical-token"
+    assert extra["group_token"] == "legacy-token"
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_uses_scoped_token_not_ambient_default(monkeypatch):
+    import agent.secret_scope as secrets
+
+    monkeypatch.setenv("VK_GROUP_TOKEN", "ambient-default-token")
+    request = AsyncMock(return_value={"response": 1})
+    monkeypatch.setattr("plugins.platforms.vk.adapter._http_json_async", request)
+    old_active = secrets.is_multiplex_active()
+    scope_token = secrets.set_secret_scope({"VK_GROUP_TOKEN": "scoped-send-token"})
+    secrets.set_multiplex_active(True)
+    try:
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, token="yaml-token"), "2000000042", "hello"
+        )
+    finally:
+        secrets.reset_secret_scope(scope_token)
+        secrets.set_multiplex_active(old_active)
+
+    assert result["success"] is True
+    assert request.await_args.args[1]["access_token"] == "scoped-send-token"
 
 
 def test_vk_apply_yaml_config_preserves_canonical_reaction_settings(monkeypatch):

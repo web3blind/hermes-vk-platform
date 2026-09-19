@@ -139,6 +139,26 @@ VK_GROUP_ID=123456789
 
 `VK_GROUP_ID` is the numeric community id without a leading minus sign.
 
+### Multiple profiles in one gateway
+
+Version 0.2.3 reads VK credentials, allowlists and environment settings through
+Hermes' active profile secret scope. A missing scoped value does **not** fall
+back to the default profile's process environment. Set credentials and access
+controls for each independently connected profile; a profile without its own
+VK connection settings must not inherit another profile's community token.
+Profile-specific configuration remains a valid fallback within that profile.
+
+The legacy YAML bridge keeps values on the current profile's configuration
+instead of writing them to process-global environment variables when a profile
+scope is active. Both dictionary and object configuration forms are supported.
+Outside a profile scope, the existing single-profile environment behavior is
+preserved.
+
+On connection, the adapter also invokes native handler factories registered by
+other Hermes plugins through `register_platform_handler`. This enables that
+existing extension surface; VK itself still registers no tools, hooks or
+middleware.
+
 ### Recommended allowlist
 
 Do **not** run a personal Hermes agent open to all VK users. Configure at least one allowlist:
@@ -286,7 +306,7 @@ does not recover `message_event` callback clicks.
 
 To avoid these additional recurring VK reads, set
 `VK_FALLBACK_POLL_ENABLED=false` explicitly in the environment and restart the
-gateway. Do not rely on YAML boolean `false` for this toggle in versions 0.2.1–0.2.2.
+gateway. Do not rely on YAML boolean `false` for this toggle in version 0.2.3.
 The runtime currently treats that YAML value as absent and keeps the default
 enabled behavior.
 

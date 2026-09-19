@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
-from gateway.config import Platform
+from agent.secret_scope import current_secret_scope
+from gateway.config import Platform, _getenv
 from gateway.session import build_session_key
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -558,7 +559,7 @@ def _parse_users_by_peer(value: Any) -> dict[str, set[str]]:
 
 
 def _redact_token(text: str) -> str:
-    for token in (os.getenv("VK_GROUP_TOKEN", ""), os.getenv("VK_USER_TOKEN", ""), os.getenv("VKBLOG_USER_TOKEN", "")):
+    for token in (_getenv("VK_GROUP_TOKEN", ""), _getenv("VK_USER_TOKEN", ""), _getenv("VKBLOG_USER_TOKEN", "")):
         if token:
             text = text.replace(token, "[REDACTED]")
     return text
@@ -891,13 +892,13 @@ class VKAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("vk"))
         extra = getattr(config, "extra", {}) or {}
 
-        self.token = os.getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token", "")
+        self.token = _getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token", "")
         # Optional user token for VK API methods that are not available to
         # community tokens (notably ``video.get``). It is used only inside the
         # VK plugin as a native API fallback, never exposed to the agent.
-        self.user_token = os.getenv("VK_USER_TOKEN") or os.getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
-        self.group_id = str(os.getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
-        self.api_version = str(os.getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
+        self.user_token = _getenv("VK_USER_TOKEN") or _getenv("VKBLOG_USER_TOKEN") or extra.get("user_token", "")
+        self.group_id = str(_getenv("VK_GROUP_ID") or extra.get("group_id", "")).lstrip("-")
+        self.api_version = str(_getenv("VK_API_VERSION") or extra.get("api_version", VK_API_VERSION))
         # UI-only policy: strict YAML booleans; malformed values inherit defaults.
         keyboard_enabled = extra.get("persistent_keyboard_enabled", True)
         self.persistent_keyboard_enabled = keyboard_enabled if isinstance(keyboard_enabled, bool) else True
@@ -921,54 +922,54 @@ class VKAdapter(BasePlatformAdapter):
             except re.error:
                 logger.warning("VK: invalid mention pattern ignored")
 
-        self.allowed_users = _split_csv(os.getenv("VK_ALLOWED_USERS") or extra.get("allowed_users"))
-        self.allowed_peers = _split_csv(os.getenv("VK_ALLOWED_PEERS") or extra.get("allowed_peers"))
+        self.allowed_users = _split_csv(_getenv("VK_ALLOWED_USERS") or extra.get("allowed_users"))
+        self.allowed_peers = _split_csv(_getenv("VK_ALLOWED_PEERS") or extra.get("allowed_peers"))
         self.allowed_users_by_peer = _parse_users_by_peer(
-            os.getenv("VK_ALLOWED_USERS_BY_PEER") or extra.get("allowed_users_by_peer")
+            _getenv("VK_ALLOWED_USERS_BY_PEER") or extra.get("allowed_users_by_peer")
         )
-        self.allow_all_users = _truthy(os.getenv("VK_ALLOW_ALL_USERS") or extra.get("allow_all_users"))
-        self.access_policy = str(os.getenv("VK_ACCESS_POLICY") or extra.get("access_policy") or "any").strip().lower()
+        self.allow_all_users = _truthy(_getenv("VK_ALLOW_ALL_USERS") or extra.get("allow_all_users"))
+        self.access_policy = str(_getenv("VK_ACCESS_POLICY") or extra.get("access_policy") or "any").strip().lower()
         self.dedupe_ttl_seconds = _parse_positive_int(
-            os.getenv("VK_DEDUPE_TTL_SECONDS") or extra.get("dedupe_ttl_seconds"),
+            _getenv("VK_DEDUPE_TTL_SECONDS") or extra.get("dedupe_ttl_seconds"),
             DEFAULT_DEDUPE_TTL_SECONDS,
         )
         self.max_attachment_bytes = _parse_positive_int(
-            os.getenv("VK_MAX_ATTACHMENT_BYTES") or extra.get("max_attachment_bytes"),
+            _getenv("VK_MAX_ATTACHMENT_BYTES") or extra.get("max_attachment_bytes"),
             DEFAULT_MAX_ATTACHMENT_BYTES,
         )
         access_policy = "allowlist" if self.allowed_users or self.allowed_peers or self.allowed_users_by_peer else "open"
         self._dm_policy = access_policy
         self._group_policy = access_policy
 
-        self.home_channel = str(os.getenv("VK_HOME_CHANNEL") or extra.get("home_channel") or "").strip()
+        self.home_channel = str(_getenv("VK_HOME_CHANNEL") or extra.get("home_channel") or "").strip()
         self.max_message_length = int(extra.get("max_message_length") or 4096)
-        self.download_attachments = _truthy(os.getenv("VK_DOWNLOAD_ATTACHMENTS") or extra.get("download_attachments"))
+        self.download_attachments = _truthy(_getenv("VK_DOWNLOAD_ATTACHMENTS") or extra.get("download_attachments"))
 
         # Message-reaction acks (mirrors Telegram's 👀 → ✅/❌ lifecycle):
         # progress reaction on intake, swapped for OK/FAIL when processing
         # completes. VK identifies reactions by numeric id, not emoji; ids are
         # community-scoped, so the common defaults are exposed as env vars
         # (see the _VK_REACTION_* constants). 0 disables a step.
-        self.reactions_enabled = _truthy(os.getenv("VK_REACTIONS_ENABLED") or extra.get("reactions_enabled"))
+        self.reactions_enabled = _truthy(_getenv("VK_REACTIONS_ENABLED") or extra.get("reactions_enabled"))
         self.reaction_progress = _parse_non_negative_int(
-            os.getenv("VK_REACTION_PROGRESS") or extra.get("reaction_progress"),
+            _getenv("VK_REACTION_PROGRESS") or extra.get("reaction_progress"),
             _VK_REACTION_PROGRESS_DEFAULT,
         )
         self.reaction_ok = _parse_non_negative_int(
-            os.getenv("VK_REACTION_OK") or extra.get("reaction_ok"), _VK_REACTION_OK
+            _getenv("VK_REACTION_OK") or extra.get("reaction_ok"), _VK_REACTION_OK
         )
         self.reaction_fail = _parse_non_negative_int(
-            os.getenv("VK_REACTION_FAIL") or extra.get("reaction_fail"), _VK_REACTION_FAIL
+            _getenv("VK_REACTION_FAIL") or extra.get("reaction_fail"), _VK_REACTION_FAIL
         )
         self._delete_reaction_supported: Optional[bool] = None
 
-        self.fallback_poll_enabled = _truthy(os.getenv("VK_FALLBACK_POLL_ENABLED") or extra.get("fallback_poll_enabled") or "true")
+        self.fallback_poll_enabled = _truthy(_getenv("VK_FALLBACK_POLL_ENABLED") or extra.get("fallback_poll_enabled") or "true")
         self.fallback_poll_interval_seconds = _parse_positive_int(
-            os.getenv("VK_FALLBACK_POLL_INTERVAL_SECONDS") or extra.get("fallback_poll_interval_seconds"),
+            _getenv("VK_FALLBACK_POLL_INTERVAL_SECONDS") or extra.get("fallback_poll_interval_seconds"),
             15,
         )
         self.fallback_poll_batch_size = _parse_positive_int(
-            os.getenv("VK_FALLBACK_POLL_BATCH_SIZE") or extra.get("fallback_poll_batch_size"),
+            _getenv("VK_FALLBACK_POLL_BATCH_SIZE") or extra.get("fallback_poll_batch_size"),
             25,
         )
 
@@ -1048,6 +1049,7 @@ class VKAdapter(BasePlatformAdapter):
             self._fallback_poll_task = asyncio.create_task(self._fallback_poll_loop(), name="vk-fallback-poll")
         self._mark_connected()
         logger.info("VK: connected to group %s via long poll", self.group_id)
+        self._wire_plugin_handlers(None)  # plugin-registered native handlers
         return True
 
     async def _diagnose_callback_settings(self) -> None:
@@ -4065,29 +4067,29 @@ def check_vk_requirements() -> bool:
 
 
 def _env_enablement() -> Optional[dict[str, Any]]:
-    token = os.getenv("VK_GROUP_TOKEN")
-    group_id = os.getenv("VK_GROUP_ID")
+    token = _getenv("VK_GROUP_TOKEN")
+    group_id = _getenv("VK_GROUP_ID")
     if not token or not group_id:
         return None
     extra = {
         "group_id": group_id.lstrip("-"),
-        "allowed_users": sorted(_split_csv(os.getenv("VK_ALLOWED_USERS"))),
-        "allowed_peers": sorted(_split_csv(os.getenv("VK_ALLOWED_PEERS"))),
-        "allow_all_users": _truthy(os.getenv("VK_ALLOW_ALL_USERS")),
+        "allowed_users": sorted(_split_csv(_getenv("VK_ALLOWED_USERS"))),
+        "allowed_peers": sorted(_split_csv(_getenv("VK_ALLOWED_PEERS"))),
+        "allow_all_users": _truthy(_getenv("VK_ALLOW_ALL_USERS")),
     }
-    access_policy = os.getenv("VK_ACCESS_POLICY")
+    access_policy = _getenv("VK_ACCESS_POLICY")
     if access_policy:
         extra["access_policy"] = access_policy
-    users_by_peer = os.getenv("VK_ALLOWED_USERS_BY_PEER")
+    users_by_peer = _getenv("VK_ALLOWED_USERS_BY_PEER")
     if users_by_peer:
         extra["allowed_users_by_peer"] = {k: sorted(v) for k, v in _parse_users_by_peer(users_by_peer).items()}
-    max_attachment_bytes = os.getenv("VK_MAX_ATTACHMENT_BYTES")
+    max_attachment_bytes = _getenv("VK_MAX_ATTACHMENT_BYTES")
     if max_attachment_bytes:
         extra["max_attachment_bytes"] = _parse_positive_int(max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES)
-    dedupe_ttl = os.getenv("VK_DEDUPE_TTL_SECONDS")
+    dedupe_ttl = _getenv("VK_DEDUPE_TTL_SECONDS")
     if dedupe_ttl:
         extra["dedupe_ttl_seconds"] = _parse_positive_int(dedupe_ttl, DEFAULT_DEDUPE_TTL_SECONDS)
-    home = os.getenv("VK_HOME_CHANNEL")
+    home = _getenv("VK_HOME_CHANNEL")
     if home:
         extra["home_channel"] = home
     return extra
@@ -4130,12 +4132,15 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
             )
         else:
             value_str = str(value)
-        if not os.getenv(env_name):
+        # Scoped YAML belongs to this profile config, never process-global env.
+        if current_secret_scope() is None and not _getenv(env_name):
             os.environ[env_name] = value_str
-        if key != "group_token":
-            extra[key] = value
-    if "group_token" in vk_cfg and not getattr(platform_cfg, "token", None):
-        platform_cfg.token = str(vk_cfg["group_token"])
+        extra[key] = value
+    if "group_token" in vk_cfg:
+        if isinstance(platform_cfg, dict):
+            platform_cfg.setdefault("token", str(vk_cfg["group_token"]))
+        elif not getattr(platform_cfg, "token", None):
+            platform_cfg.token = str(vk_cfg["group_token"])
     for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "mention_patterns",
                 "persistent_keyboard_enabled", "persistent_keyboard_by_peer"):
         value = vk_cfg.get(key)
@@ -4158,8 +4163,8 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
 
 def _is_connected(config: Any) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    token = os.getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token")
-    group_id = os.getenv("VK_GROUP_ID") or extra.get("group_id")
+    token = _getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token")
+    group_id = _getenv("VK_GROUP_ID") or extra.get("group_id")
     return bool(token and group_id)
 
 
@@ -4180,7 +4185,7 @@ async def _standalone_send(config_or_chat_id: Any, chat_id: Any = None, text: st
 
     extra = getattr(platform_config, "extra", {}) or {}
     token = (
-        os.getenv("VK_GROUP_TOKEN")
+        _getenv("VK_GROUP_TOKEN")
         or getattr(platform_config, "token", None)
         or extra.get("group_token")
     )
@@ -4188,7 +4193,7 @@ async def _standalone_send(config_or_chat_id: Any, chat_id: Any = None, text: st
         return {"success": False, "error": "VK_GROUP_TOKEN is not configured"}
     params = {
         "access_token": token,
-        "v": os.getenv("VK_API_VERSION") or VK_API_VERSION,
+        "v": _getenv("VK_API_VERSION") or VK_API_VERSION,
         "peer_ids": str(chat_id),
         "message": text or "",
         "random_id": random.randint(1, 2_147_483_647),

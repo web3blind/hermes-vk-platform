@@ -36,6 +36,34 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - VK Group Long Poll API enabled for `message_new`, `message_edit` and `message_event` (callback buttons).
 - A VK community access token with `messages` permission.
 
+### Hermes registration compatibility
+
+Hermes Agent v2026.9.14 includes the `PlatformEntry.parse_target_ref_fn`
+contract used for project-lane outbound targets. Plugin version 0.2.1 also
+supports registration when only that field is absent and the remaining host
+API matches: all base
+registration, configuration, access-control, and direct-peer send callbacks
+remain registered. The plugin logs a compatibility warning in that case.
+
+Lane-qualified outbound targets such as `2000000042:lane:alpha` require a
+Hermes build with `parse_target_ref_fn`. On a build without it, use a direct
+numeric peer target or update Hermes. Do not redirect a lane target by guessing
+or removing its lane suffix.
+
+Registration compatibility is not a full VK end-to-end check. After an install
+or Hermes update, use this smoke checklist:
+
+1. `hermes plugins list --enabled` shows `vk-platform` enabled.
+2. `hermes gateway status` shows VK configured/connected after the gateway is
+   started with valid credentials.
+3. Fresh gateway logs contain no VK plugin load or registration exception.
+4. If the compatibility warning appears, test only a direct numeric peer
+   target; update Hermes before using project-lane outbound targets.
+
+These checks prove plugin loading and connection state, not VK delivery. A
+full end-to-end check additionally requires an authorized live VK message and
+reply.
+
 ## Install
 
 From GitHub:
@@ -221,9 +249,32 @@ VK_MAX_ATTACHMENT_BYTES=26214400
 # In-memory duplicate event TTL in seconds. Default: 1800.
 VK_DEDUPE_TTL_SECONDS=1800
 
+# Recurring message-history fallback. Default: enabled.
+# Set this ENV value explicitly to false to disable the extra VK API reads.
+VK_FALLBACK_POLL_ENABLED=true
+
+# Poll timing and per-peer conversation-message-id batch. Defaults shown.
+# Runtime minimum interval: 5 seconds. Batch size is clamped to 1..100.
+VK_FALLBACK_POLL_INTERVAL_SECONDS=15
+VK_FALLBACK_POLL_BATCH_SIZE=25
+
 # Optional user token for video metadata fallback. Not needed for normal chat usage.
 VK_USER_TOKEN=
 ```
+
+### Message-history fallback polling
+
+Fallback polling is enabled by default. In addition to Group Long Poll, the
+adapter makes recurring `messages.getByConversationMessageId` reads for peers
+present in `VK_ALLOWED_PEERS`, the configured home channel, or project-lane
+configuration. This recovers ordinary user messages that Long Poll missed; it
+does not recover `message_event` callback clicks.
+
+To avoid these additional recurring VK reads, set
+`VK_FALLBACK_POLL_ENABLED=false` explicitly in the environment and restart the
+gateway. Do not rely on YAML boolean `false` for this toggle in version 0.2.1.
+The runtime currently treats that YAML value as absent and keeps the default
+enabled behavior.
 
 ### Message reactions (👌 → 👍/👎)
 

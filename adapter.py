@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -4215,6 +4216,13 @@ def _build_adapter(config: Any) -> VKAdapter:
     return VKAdapter(config)
 
 
+def _platform_entry_supports_lane_target_parser() -> bool:
+    """Probe the host contract without weakening registration validation."""
+    from gateway.platform_registry import PlatformEntry
+
+    return "parse_target_ref_fn" in inspect.signature(PlatformEntry).parameters
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     try:
@@ -4222,7 +4230,7 @@ def register(ctx) -> None:
     except Exception:  # pragma: no cover - setup helper is optional at runtime
         setup_vk_platform = None
 
-    ctx.register_platform(
+    registration: dict[str, Any] = dict(
         name="vk",
         label="VK Messenger",
         adapter_factory=_build_adapter,
@@ -4237,10 +4245,17 @@ def register(ctx) -> None:
         allowed_users_env="VK_ALLOWED_USERS",
         allow_all_env="VK_ALLOW_ALL_USERS",
         cron_deliver_env_var="VK_HOME_CHANNEL",
-        parse_target_ref_fn=_parse_vk_target_ref,
         standalone_sender_fn=_standalone_send,
         emoji="🔵",
         platform_hint="You are connected through VK Messenger. Keep replies concise; VK has no Telegram-style topics.",
         max_message_length=4096,
         allow_update_command=True,
     )
+    if _platform_entry_supports_lane_target_parser():
+        registration["parse_target_ref_fn"] = _parse_vk_target_ref
+    else:
+        logger.warning(
+            "VK: this Hermes PlatformEntry has no parse_target_ref_fn; "
+            "lane-qualified outbound targets require a newer Hermes build"
+        )
+    ctx.register_platform(**registration)

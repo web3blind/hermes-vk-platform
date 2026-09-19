@@ -8,6 +8,10 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes-ref: [main, v2026.9.14]
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -18,9 +22,9 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          # The scoped gateway integration test imports env_loader and account_usage.
-          python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pyyaml==6.0.3 python-dotenv==1.2.3 httpx==0.28.1
-          git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent
+          # Scoped gateway imports need dotenv/httpx and local-runtime psutil.
+          python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pyyaml==6.0.3 python-dotenv==1.2.3 httpx==0.28.1 psutil==7.2.2
+          git clone --depth 1 --branch "${{ matrix.hermes-ref }}" https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent
           mkdir -p /tmp/hermes-agent/plugins/platforms/vk
           cp adapter.py plugin.yaml setup_helper.py __init__.py /tmp/hermes-agent/plugins/platforms/vk/
       - name: Syntax check
@@ -28,6 +32,8 @@ jobs:
         env:
           PYTHONPATH: /tmp/hermes-agent:.
       - name: Run tests
-        run: python -m pytest -q tests/
+        run: |
+          export HERMES_PYTHON="$(command -v python)"
+          /tmp/hermes-agent/scripts/run_tests.sh "$GITHUB_WORKSPACE/tests"
         env:
           PYTHONPATH: /tmp/hermes-agent:.

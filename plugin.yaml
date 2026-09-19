@@ -2,7 +2,7 @@ manifest_version: 1
 name: vk-platform
 label: VK Messenger
 kind: platform
-version: 0.2.0
+version: 0.2.1
 description: >
   VK Messenger gateway adapter for Hermes Agent. Uses VK community messages
   and Group Long Poll to relay messages between VK chats and Hermes.
@@ -43,6 +43,18 @@ optional_env:
   - name: VK_DEDUPE_TTL_SECONDS
     description: "Duplicate message_new TTL in seconds; dedupe key is peer_id + conversation_message_id"
     prompt: "Duplicate event TTL seconds"
+    secret: false
+  - name: VK_FALLBACK_POLL_ENABLED
+    description: "Enable recurring message-history fallback reads for configured peers (default true; set env to false to disable)"
+    prompt: "Enable fallback message-history polling? (true/false)"
+    secret: false
+  - name: VK_FALLBACK_POLL_INTERVAL_SECONDS
+    description: "Fallback poll interval in seconds (default 15; minimum effective interval 5)"
+    prompt: "Fallback poll interval seconds"
+    secret: false
+  - name: VK_FALLBACK_POLL_BATCH_SIZE
+    description: "Conversation message ids requested per peer and poll (default 25; clamped to 1..100)"
+    prompt: "Fallback poll batch size"
     secret: false
   - name: VK_MAX_ATTACHMENT_BYTES
     description: "Maximum inbound attachment download size in bytes"

@@ -27,6 +27,36 @@ VK_ALLOWED_PEERS=2000000001
 
 ## Common problems
 
+### Plugin registration mentions `parse_target_ref_fn`
+
+Upgrade the VK plugin to version 0.2.1 or newer. Version 0.2.1 checks the actual
+host `PlatformEntry` signature and omits only this optional callback when the
+field is absent. It does not discard other unknown fields or retry after a
+registration `TypeError`, so genuine host/plugin API mismatches remain visible.
+
+Hermes Agent v2026.9.14 includes this callback. A warning that the callback is
+missing therefore indicates a different, forked, development, or otherwise
+API-mismatched Hermes build; it is not expected on that release. Base VK
+registration, ACL/config callbacks, and direct numeric-peer sends remain
+available when only this field is missing.
+
+Project-lane outbound targets such as `2000000042:lane:alpha` are not supported
+without the callback. Update Hermes before using them; target-resolution
+behavior depends on the host build and is not covered by this registration
+fallback. Never remove the lane suffix and silently send to a guessed recipient.
+
+Load/connection smoke check (not a full VK end-to-end test):
+
+```bash
+hermes plugins list --enabled
+hermes gateway status
+grep -iE 'VK:|vk-platform|parse_target_ref_fn' ~/.hermes/logs/gateway.log | tail -80
+```
+
+Expect the plugin to be enabled, VK to be configured/connected, and no plugin
+load exception. A live authorized VK request/reply is still required to prove
+end-to-end delivery.
+
 ### `VK_GROUP_TOKEN and VK_GROUP_ID must be configured`
 
 Set both env vars in `~/.hermes/.env`, then restart the gateway.

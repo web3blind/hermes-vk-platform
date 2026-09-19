@@ -27,6 +27,19 @@ VK_ALLOWED_PEERS=2000000001
 
 ## Common problems
 
+### PyPI Hermes 0.19.0 / missing intake APIs
+
+VK plugin 0.2.2 requires Hermes **>=0.21.3**. The tested released baseline is
+GitHub tag `v2026.9.14` (package version `0.21.3`), not unreleased main. PyPI
+0.19.0 lacks `MessageEvent.allow_gateway_control` and
+`BasePlatformAdapter._event_session_key`, as well as the optional target parser.
+Skipping the parser alone does not make that host compatible.
+
+The manifest declares the minimum; registration also checks the required
+intake APIs and fails clearly before registering VK if they are absent. Keep
+your working channel until you can safely upgrade Hermes through the appropriate
+installation channel. Do not patch away the intake/control safeguards.
+
 ### Plugin registration mentions `parse_target_ref_fn`
 
 Upgrade the VK plugin to version 0.2.1 or newer. Version 0.2.1 checks the actual

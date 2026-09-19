@@ -4225,6 +4225,16 @@ def _platform_entry_supports_lane_target_parser() -> bool:
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    missing = []
+    if "allow_gateway_control" not in inspect.signature(MessageEvent).parameters:
+        missing.append("MessageEvent.allow_gateway_control")
+    if not callable(getattr(BasePlatformAdapter, "_event_session_key", None)):
+        missing.append("BasePlatformAdapter._event_session_key")
+    if missing:
+        raise RuntimeError(
+            "VK plugin requires Hermes >=0.21.3 (tested GitHub release v2026.9.14); "
+            "PyPI 0.19.0 is unsupported. Missing host APIs: " + ", ".join(missing)
+        )
     try:
         from .setup_helper import setup_vk_platform
     except Exception:  # pragma: no cover - setup helper is optional at runtime

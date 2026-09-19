@@ -38,6 +38,20 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 
 ### Hermes registration compatibility
 
+**Requires Hermes Agent >=0.21.3. PyPI 0.19.0 is not supported.**
+The tested released baseline is GitHub tag
+[`v2026.9.14`](https://github.com/NousResearch/hermes-agent/releases/tag/v2026.9.14),
+commit `345cd2b057a452236de401d3534b8502a7465e8d`, whose package version is
+`0.21.3`. This is a supported baseline, not a claim about the earliest commit
+containing every API. Unreleased `main` is not required.
+
+GitHub release tags and PyPI packages may differ: at verification, PyPI still
+published `0.19.0`. Check the installed version and installation channel before
+upgrading; do not migrate a production deployment just to try the plugin.
+Version 0.2.2 declares the minimum in its manifest and rejects missing
+`MessageEvent.allow_gateway_control` or `BasePlatformAdapter._event_session_key`
+before registering VK, including on hosts that ignore the manifest requirement.
+
 Hermes Agent v2026.9.14 includes the `PlatformEntry.parse_target_ref_fn`
 contract used for project-lane outbound targets. Plugin version 0.2.1 also
 supports registration when only that field is absent and the remaining host
@@ -272,7 +286,7 @@ does not recover `message_event` callback clicks.
 
 To avoid these additional recurring VK reads, set
 `VK_FALLBACK_POLL_ENABLED=false` explicitly in the environment and restart the
-gateway. Do not rely on YAML boolean `false` for this toggle in version 0.2.1.
+gateway. Do not rely on YAML boolean `false` for this toggle in versions 0.2.1–0.2.2.
 The runtime currently treats that YAML value as absent and keeps the default
 enabled behavior.
 

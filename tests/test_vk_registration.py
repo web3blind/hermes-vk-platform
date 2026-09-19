@@ -123,7 +123,22 @@ def test_register_propagates_unrelated_type_error():
         plugin.register(ctx)
 
 
-def _discovery_probe(tmp_path, missing_parser):
+@pytest.mark.parametrize("missing_api", ["event_control", "session_key"])
+def test_register_rejects_missing_required_intake_api(monkeypatch, missing_api):
+    plugin = _load_plugin_package()
+    adapter = sys.modules[plugin.__name__ + ".adapter"]
+    if missing_api == "event_control":
+        monkeypatch.setattr(adapter, "MessageEvent", lambda text: None)
+    else:
+        monkeypatch.setattr(adapter.BasePlatformAdapter, "_event_session_key", None)
+    ctx = _CapturingContext()
+
+    with pytest.raises(RuntimeError, match=r"requires Hermes >=0\.21\.3"):
+        plugin.register(ctx)
+    assert ctx.kwargs is None
+
+
+def _discovery_probe(tmp_path, missing_parser, missing_session_key=False):
     home = tmp_path / "home"
     plugin_copy = home / "plugins" / "vk-platform"
     shutil.copytree(
@@ -145,6 +160,9 @@ def _discovery_probe(tmp_path, missing_parser):
         import sys
 
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+        if {missing_session_key!r}:
+            from gateway.platforms.base import BasePlatformAdapter
+            BasePlatformAdapter._event_session_key = None
         import gateway.platform_registry as registry_module
         original = registry_module.PlatformEntry
         if {missing_parser!r}:
@@ -214,3 +232,11 @@ def test_real_plugin_discovery_registration(tmp_path, missing_parser):
     }
     warning = "lane-qualified outbound targets require a newer Hermes build"
     assert (warning in stderr) is missing_parser
+
+
+def test_real_plugin_discovery_rejects_missing_intake_contract(tmp_path):
+    result, stderr = _discovery_probe(tmp_path, False, missing_session_key=True)
+
+    assert result["entry"] is False
+    assert "requires Hermes >=0.21.3" in result["error"]
+    assert "BasePlatformAdapter._event_session_key" in result["error"]

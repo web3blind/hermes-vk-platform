@@ -909,6 +909,11 @@ class VKAdapter(BasePlatformAdapter):
         } if isinstance(keyboard_by_peer, dict) else {}
         # Global VK group invocation policy, opt-in; never an authorization grant.
         self.require_mention = _truthy(extra.get("require_mention"))
+        require_mention_by_peer = extra.get("require_mention_by_peer")
+        self.require_mention_by_peer = {
+            str(peer): enabled for peer, enabled in require_mention_by_peer.items()
+            if isinstance(enabled, bool)
+        } if isinstance(require_mention_by_peer, dict) else {}
         self._mention_patterns: list[re.Pattern] = []
         patterns = extra.get("mention_patterns") or []
         if not isinstance(patterns, (list, tuple)):
@@ -2545,7 +2550,8 @@ class VKAdapter(BasePlatformAdapter):
         signal; free-text exceptions require an exact-session pending control.
         No API, session creation or persisted state writes are allowed here.
         """
-        if not self.require_mention or not self._is_group_peer(peer_id):
+        require_mention = self.require_mention_by_peer.get(str(peer_id), self.require_mention)
+        if not require_mention or not self._is_group_peer(peer_id):
             return True
         text = str(msg.get("text") or "").strip()
         command = text.split(maxsplit=1)[0].lower() if text.startswith("/") else ""
@@ -4141,14 +4147,15 @@ def _apply_yaml_config(yaml_cfg: dict[str, Any], platform_cfg: Any) -> Optional[
             platform_cfg.setdefault("token", str(vk_cfg["group_token"]))
         elif not getattr(platform_cfg, "token", None):
             platform_cfg.token = str(vk_cfg["group_token"])
-    for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "mention_patterns",
+    for key in ("channel_prompts", "channel_skill_bindings", "require_mention", "require_mention_by_peer",
+                "mention_patterns",
                 "persistent_keyboard_enabled", "persistent_keyboard_by_peer"):
         value = vk_cfg.get(key)
         if value is not None:
             extra[key] = value
     if isinstance(platforms_vk_extra, dict):
         for key in ("reactions_enabled", "reaction_progress", "reaction_ok", "reaction_fail",
-                    "require_mention", "mention_patterns",
+                    "require_mention", "require_mention_by_peer", "mention_patterns",
                     "persistent_keyboard_enabled", "persistent_keyboard_by_peer"):
             if key in platforms_vk_extra:
                 extra[key] = platforms_vk_extra[key]

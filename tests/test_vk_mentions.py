@@ -132,14 +132,80 @@ async def test_global_groups_dm_and_default_off(gated):
         a.handle_message.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override_peer", [PEER, int(PEER)], ids=["string-key", "integer-key"])
+async def test_per_peer_override_raw_intake_preserves_global_fallback_and_acl(override_peer):
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={
+        "allowed_peers": [PEER, "2000000043"],
+        "allowed_users_by_peer": {PEER: ["100"]},
+        "require_mention": True,
+        "require_mention_by_peer": {override_peer: False},
+        "mention_patterns": [NAME],
+    }))
+    adapter._vk_method = AsyncMock(return_value={"response": {}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(intake_update(1, "без имени"))
+    await adapter._handle_update(intake_update(2, "без имени", peer=2000000043))
+    await adapter._handle_update(intake_update(3, "без имени", user=222))
+    await drain_intake(adapter)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args_list[0].args[0]
+    assert event.source.chat_id == PEER
+    assert event.source.user_id == "100"
+
+
+@pytest.mark.asyncio
+async def test_invalid_per_peer_override_inherits_global_gate():
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={
+        "allowed_peers": [PEER],
+        "require_mention": True,
+        "require_mention_by_peer": {PEER: "false"},
+        "mention_patterns": [NAME],
+    }))
+    adapter._vk_method = AsyncMock(return_value={"response": {}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(intake_update(1, "без имени"))
+    await drain_intake(adapter)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_per_peer_true_override_can_enable_gate():
+    adapter = VKAdapter(PlatformConfig(enabled=True, extra={
+        "allowed_peers": [PEER, "2000000043"],
+        "require_mention": False,
+        "require_mention_by_peer": {PEER: True},
+        "mention_patterns": [NAME],
+    }))
+    adapter._vk_method = AsyncMock(return_value={"response": {}})
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_update(intake_update(1, "без имени"))
+    await adapter._handle_update(intake_update(2, "без имени", peer=2000000043))
+    await drain_intake(adapter)
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args_list[0].args[0].source.chat_id == "2000000043"
+
+
 @pytest.mark.parametrize("root", ["vk", "gateway", "platforms"])
 def test_yaml_bridge_global_settings(root):
-    values = {"require_mention": True, "mention_patterns": [NAME]}
+    values = {"require_mention": True, "require_mention_by_peer": {2000000042: False},
+              "mention_patterns": [NAME]}
     cfg = {"vk": values} if root == "vk" else ({"gateway": {"vk": values}} if root == "gateway" else {"platforms": {"vk": {"extra": values}}})
     pc = PlatformConfig(enabled=True)
     merged = _apply_yaml_config(cfg, pc)
     assert merged["require_mention"] is True
+    assert merged["require_mention_by_peer"] == {2000000042: False}
     assert merged["mention_patterns"] == [NAME]
+    if root == "platforms":
+        combined = {"vk": {"require_mention_by_peer": {PEER: True}},
+                    "platforms": {"vk": {"extra": values}}}
+        assert _apply_yaml_config(combined, pc)["require_mention_by_peer"] == {2000000042: False}
 
 
 @pytest.mark.asyncio

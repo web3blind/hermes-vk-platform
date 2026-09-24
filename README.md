@@ -221,6 +221,8 @@ by this adapter, add non-secret settings to `config.yaml`:
 ```yaml
 vk:
   require_mention: true
+  require_mention_by_peer:
+    "2000000042": false  # this conversation does not require an invocation
   mention_patterns:
     - '(?<![\w@])(?:ИИЛада|курсор)\b'
 ```
@@ -234,6 +236,9 @@ hardcoded into the plugin.
 
 The same keys are accepted under `gateway.vk` or `platforms.vk.extra` (the latter
 overrides the shorthand). Use one configuration location to avoid ambiguity.
+`require_mention_by_peer` accepts strict YAML booleans keyed by peer id. A valid
+per-peer value overrides `require_mention`; missing or invalid entries inherit the
+global setting. Numeric YAML keys are accepted, but quoted peer ids are recommended.
 DMs are unaffected. A direct reply whose raw VK `reply_message.from_id` identifies
 this bot community, or an explicit `@club<ID>` / `[club<ID>|label]` mention, also
 invokes it. Quoted/forwarded text and attachment summaries never supply a trigger.

@@ -94,7 +94,10 @@ def test_gateway_dispatches_native_vk_approval(callback_env, monkeypatch):
         future.set_result(asyncio.run(coro))
         return future
     monkeypatch.setattr(runner, '_schedule', schedule)
-    monkeypatch.setattr('gateway.run_turn_runner_approval_settle.register_timeout_notice', lambda *_a, **_k: None)
+    # Timeout-card cleanup was added after the original dispatcher.
+    import importlib.util
+    if importlib.util.find_spec('gateway.run_turn_runner_approval_settle') is not None:
+        monkeypatch.setattr('gateway.run_turn_runner_approval_settle.register_timeout_notice', lambda *_a, **_k: None)
     runner._approval_notify_sync({'command': 'touch demo', 'description': 'test'})
     sends = [p for m, p in calls if m == 'messages.send']
     assert len(sends) == 1 and 'keyboard' in sends[0]

@@ -2,7 +2,7 @@ manifest_version: 1
 name: vk-platform
 label: VK Messenger
 kind: platform
-version: 0.2.4
+version: 0.2.5
 requires_hermes: ">=0.21.3"
 description: >
   VK Messenger gateway adapter for Hermes Agent. Uses VK community messages

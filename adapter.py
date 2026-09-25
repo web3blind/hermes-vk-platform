@@ -3761,11 +3761,33 @@ class VKAdapter(BasePlatformAdapter):
         allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
-        """Send a VK inline-keyboard dangerous-command approval prompt.
+        """Legacy gateway entry point (kept for older supported Hermes hosts)."""
+        return await self._send_vk_exec_approval(
+            chat_id, command, session_key, description, metadata,
+            allow_permanent, allow_session, smart_denied,
+            self._format_exec_approval(command, description, smart_denied),
+        )
 
-        This implements the gateway's native button approval contract while
-        keeping the gateway text fallback available if sending fails.
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Modern prompt hook; also advertises native buttons to current hosts.
+
+        Do not import ExecApprovalPrompt at runtime: older supported hosts do
+        not define it. Both entry points share the same secure VK sender.
         """
+        choices = {choice for _label, choice, _style in prompt.actions}
+        return await self._send_vk_exec_approval(
+            prompt.chat_id, prompt.command, prompt.session_key,
+            prompt.description, prompt.metadata,
+            "always" in choices, "session" in choices, prompt.smart_denied,
+            prompt.text,
+        )
+
+    async def _send_vk_exec_approval(
+        self, chat_id: str, command: str, session_key: str, description: str,
+        metadata: Optional[Dict[str, Any]], allow_permanent: bool,
+        allow_session: bool, smart_denied: bool, text: str,
+    ) -> SendResult:
+        """Render either approval API without changing callback authorization."""
         if not self.token:
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
         try:
@@ -3781,7 +3803,7 @@ class VKAdapter(BasePlatformAdapter):
                     allowed_choices.add("always")
             params = {
                 "peer_ids": str(chat_id),
-                "message": self.format_message(self._format_exec_approval(command, description, smart_denied)),
+                "message": self.format_message(text),
                 "random_id": random.randint(1, 2_147_483_647),
                 "keyboard": self._exec_approval_keyboard(
                     approval_id,

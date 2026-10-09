@@ -7,7 +7,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 import test_vk_adapter as existing
-from test_vk_adapter import callback_env, clear_vk_env, callback_update
+from test_vk_adapter import callback_update
+
+# Register shared fixtures explicitly instead of importing fixture functions.
+pytest_plugins = ['test_vk_adapter']
 
 
 async def dispatch(adapter, payload, **kwargs):

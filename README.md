@@ -21,6 +21,72 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Optional Telegram-style message-reaction acks (`VK_REACTIONS_ENABLED`): a progress reaction while the agent works, then 👍/👎 on completion.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
 
+## Plugin callback API (0.2.6)
+
+Any plugin can register an isolated callback namespace on a live `VKAdapter`:
+
+```python
+import json
+
+async def handle_button(event):
+    # These are the actual VK callback actor/peer/message IDs, not prompt state.
+    peer = str(event["peer_id"])
+    actor = str(event["user_id"])
+    cmid = event.get("conversation_message_id")
+    data = event["payload"]["data"]
+    # Verify your own nonce, actor, peer, message, expiry and one-shot state.
+    # A namespace is routing, not a grant to answer another user's question.
+    return "Ответ принят"  # str or None; adapter sends the snackbar ACK
+
+cleanup = adapter.register_callback_handler("my_plugin", handle_button)
+ctx.on_unload(cleanup)
+
+button = {
+    "action": {
+        "type": "callback", "label": "Ответить",
+        "payload": json.dumps({"hermes_callback": "my_plugin", "data": {"nonce": "opaque-id"}}),
+    },
+    "color": "primary",
+}
+```
+
+- `register_callback_handler(namespace, handler) -> cleanup`: namespaces must
+  match `[a-z0-9_-]{1,64}`. A duplicate live namespace raises `ValueError`;
+  cleanup is idempotent and cannot unregister a later replacement.
+- Handler signature: `async handler(event: dict) -> str | None`. The event
+  retains actual `peer_id`, `user_id`, `event_id`, `conversation_message_id`,
+  `message_id` and any other received object fields (missing IDs stay missing).
+  `payload` is a detached copy of the decoded envelope; `data` is also exposed
+  as `event["data"]`. Handler mutation cannot alter the incoming payload.
+- Envelope keys must be exactly `hermes_callback` and `data`; `data` must be
+  JSON-serializable and the decoded envelope must fit in 4096 UTF-8 bytes.
+  VK imposes its own smaller outbound button-payload limit; use opaque IDs.
+- The SDK access policy runs **before** plugin dispatch. Presence of the
+  reserved key consumes the callback: unknown/unloaded names or malformed/mixed
+  envelopes receive a neutral ACK, never a builtin clarify/approval/project action.
+- Handlers execute inside native tracked callback intake with a ten-second
+  cooperative timeout. They must be async, non-blocking and cancellation-safe;
+  do not spawn untracked tasks or suppress cancellation. Exceptions/timeouts
+  produce a generic ACK without reflecting/logging exception secrets. Task
+  cancellation gets a generic ACK and propagates. Returned strings are trusted
+  plugin UI text and truncated to 90 characters; `None` gets a neutral receipt.
+  Unload removes registration, not an already-running handler.
+
+For project-bound questions, use the **sent-message mapping**, not the user's
+currently selected lane. Send with `metadata={"thread_id": "lane:my_lane"}` so
+normal adapter delivery persists the mapping. Existing helper lookup:
+
+```python
+lane = adapter._reply_lane(str(event["peer_id"]), {
+    "reply_message": {"conversation_message_id": event.get("conversation_message_id")}
+})
+# lane is None if the actual message is unmapped/deleted; fail closed.
+```
+
+`_reply_lane` is an existing internal helper, not a new core hook. Do not replace
+an absent actual conversation-message ID with an expected prompt ID or active lane.
+Builtin callback handlers and ordinary messages are unchanged.
+
 ## Documentation
 
 - [`docs/development.md`](docs/development.md) — plugin structure, runtime flow, testing, and release checks.

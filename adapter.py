@@ -11,6 +11,7 @@ The adapter is intentionally plugin-only: it registers through
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -28,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from hermes_constants import get_hermes_home
 from agent.secret_scope import current_secret_scope
@@ -978,6 +979,8 @@ class VKAdapter(BasePlatformAdapter):
             25,
         )
 
+        self._callback_handlers: dict[str, tuple[object, Callable[[dict[str, Any]], Awaitable[str | None]]]] = {}
+        self._callback_handler_timeout = 10.0
         self._inbound_route_lock = asyncio.Lock()
         self._download_semaphore = asyncio.Semaphore(3)
         self._intake_tasks: dict[asyncio.Task, str] = {}
@@ -1961,6 +1964,72 @@ class VKAdapter(BasePlatformAdapter):
         await self._edit_project_text(peer_id, record["message_id"], label, keyboard=self._empty_inline_keyboard())
         return True
 
+    def register_callback_handler(
+        self, namespace: str, handler: Callable[[dict[str, Any]], Awaitable[str | None]],
+    ) -> Callable[[], None]:
+        """Register an async plugin callback; return identity-guarded unload cleanup.
+
+        The event is a copy of VK's object with parsed ``payload`` and ``data``.
+        No peer, actor, message identity or lane is inferred from plugin state.
+        Handlers run on the gateway loop and must cooperate with cancellation.
+        """
+        if not isinstance(namespace, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", namespace):
+            raise ValueError("invalid VK callback namespace")
+        if not callable(handler):
+            raise TypeError("VK callback handler must be callable and return an awaitable")
+        if namespace in self._callback_handlers:
+            raise ValueError("VK callback namespace already registered")
+        registration = (object(), handler)
+        self._callback_handlers[namespace] = registration
+
+        def cleanup() -> None:
+            if self._callback_handlers.get(namespace) is registration:
+                del self._callback_handlers[namespace]
+
+        return cleanup
+
+    async def _dispatch_plugin_callback(
+        self, obj: dict[str, Any], payload: dict[str, Any], peer_id: str, user_id: str,
+    ) -> None:
+        # Presence owns the callback, even for malformed/unknown namespaces.
+        # Mixed envelopes must never fall through to a privileged builtin action.
+        label = "Действие закрыто или недоступно"
+        namespace = payload.get("hermes_callback")
+        valid = (set(payload) == {"hermes_callback", "data"}
+                 and isinstance(namespace, str)
+                 and re.fullmatch(r"[a-z0-9_-]{1,64}", namespace) is not None)
+        if valid:
+            try:
+                # Validate JSON data and detach it from the inbound update.
+                encoded = json.dumps(payload, allow_nan=False, ensure_ascii=False)
+                valid = len(encoded.encode("utf-8")) <= 4096
+                detached = copy.deepcopy(payload) if valid else None
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                valid = False
+        registration = self._callback_handlers.get(namespace) if valid else None
+        if registration is not None:
+            event = dict(obj)
+            event["payload"] = detached
+            event["data"] = detached["data"]
+            try:
+                # No new background task: the native tracked intake task owns
+                # handler lifetime, timeout and gateway shutdown cancellation.
+                async with asyncio.timeout(self._callback_handler_timeout):
+                    answer = await registration[1](event)
+                if answer is not None and not isinstance(answer, str):
+                    raise TypeError("VK callback handler must return str or None")
+                label = answer if answer is not None else "Ответ обработан"
+            except asyncio.CancelledError:
+                await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id,
+                                                 "Действие прервано")
+                raise
+            except Exception:
+                # Handler errors can contain secrets; don't log exception text
+                # or reflect it into VK. Owned failures are always consumed.
+                logger.warning("VK: plugin callback failed safely")
+                label = "Не удалось обработать действие"
+        await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, label)
+
     async def _handle_message_event_update(self, update: dict[str, Any]) -> None:
         obj = update.get("object") or {}
         if not isinstance(obj, dict):
@@ -1981,6 +2050,10 @@ class VKAdapter(BasePlatformAdapter):
 
         if not isinstance(payload, dict) or not payload:
             await self._answer_message_event(str(obj.get("event_id") or ""), user_id, peer_id, "Некорректное подтверждение")
+            return
+
+        if "hermes_callback" in payload:
+            await self._dispatch_plugin_callback(obj, payload, peer_id, user_id)
             return
 
         if payload.get("vkea") is not None:

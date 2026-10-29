@@ -28,6 +28,12 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - If the tail is unavailable, fallback waits and retries without reading from
   zero. It never dispatches fallback messages dated before adapter startup or
   with an invalid/missing timestamp. This also prevents old commands from replaying.
+- Approval prompts accept the newer host's optional `request_id`. When supplied,
+  it must match the queued request as well as its displayed command and reason;
+  an unknown ID never selects a different request. Older hosts retain the
+  existing unambiguous display-text matching and text fallback.
+- Plain-text approval replies continue to use the host's approval vocabulary on
+  both released Hermes and newer builds with language-aware word lists.
 - Mention-gate rejections are logged with peer/message IDs only, not message text.
   Existing mention rules and access policies remain unchanged. See
   [troubleshooting](docs/troubleshooting.md#text-or-voice-is-received-but-the-agent-does-not-answer).

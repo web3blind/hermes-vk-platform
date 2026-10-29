@@ -2687,7 +2687,11 @@ class VKAdapter(BasePlatformAdapter):
             from gateway.run_busy import GatewayBusySessionMixin
             if command:
                 return event if has_blocking_approval(key) else False
-            choice = GatewayBusySessionMixin._PLAINTEXT_APPROVAL_WORDS.get(routed_text.lower())
+            if hasattr(GatewayBusySessionMixin, "_PLAINTEXT_APPROVAL_WORDS"):
+                words = GatewayBusySessionMixin._PLAINTEXT_APPROVAL_WORDS
+            else:
+                words = GatewayBusySessionMixin()._plaintext_approval_words()
+            choice = words.get(routed_text.lower())
             if choice and has_blocking_approval(key):
                 command, args = choice
                 event.text = f"/{command} {args}".strip()
@@ -3770,8 +3774,8 @@ class VKAdapter(BasePlatformAdapter):
                     and (text_button or record["message_id"] == f"cmid:{message_id}"))
 
     @staticmethod
-    def _capture_exec_entry(session_key: str, command: str, description: str) -> Any:
-        """Compatibility seam: gateway passes display text, not a request ID.
+    def _capture_exec_entry(session_key: str, command: str, description: str, request_id: Optional[str] = None) -> Any:
+        """Match the exact request when available; older hosts pass display text.
 
         Never guess FIFO identity from the session alone. Ambiguous redacted
         commands must use the gateway's explicit text fallback instead.
@@ -3781,6 +3785,7 @@ class VKAdapter(BasePlatformAdapter):
         with approval._lock:
             candidates = [entry for entry in approval._gateway_queues.get(session_key, ())
                           if not entry.event.is_set() and entry.result is None
+                          and (request_id is None or entry.data.get("request_id") == request_id)
                           and redact_sensitive_text(str(entry.data.get("command") or ""), force=True) == command
                           and entry.data.get("description", "dangerous command") == description]
             return candidates[0] if len(candidates) == 1 else None
@@ -3836,12 +3841,14 @@ class VKAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        request_id: Optional[str] = None,
     ) -> SendResult:
         """Legacy gateway entry point (kept for older supported Hermes hosts)."""
         return await self._send_vk_exec_approval(
             chat_id, command, session_key, description, metadata,
             allow_permanent, allow_session, smart_denied,
             self._format_exec_approval(command, description, smart_denied),
+            request_id=request_id,
         )
 
     async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
@@ -3856,19 +3863,21 @@ class VKAdapter(BasePlatformAdapter):
             prompt.description, prompt.metadata,
             "always" in choices, "session" in choices, prompt.smart_denied,
             prompt.text,
+            request_id=getattr(prompt, "request_id", None),
         )
 
     async def _send_vk_exec_approval(
         self, chat_id: str, command: str, session_key: str, description: str,
         metadata: Optional[Dict[str, Any]], allow_permanent: bool,
         allow_session: bool, smart_denied: bool, text: str,
+        request_id: Optional[str] = None,
     ) -> SendResult:
         """Render either approval API without changing callback authorization."""
         if not self.token:
             return SendResult(success=False, error="VK_GROUP_TOKEN is not configured")
         try:
             import secrets
-            entry = self._capture_exec_entry(session_key, command, description)
+            entry = self._capture_exec_entry(session_key, command, description, request_id)
             if entry is None:
                 return SendResult(success=False, error="Cannot safely identify approval; use text fallback")
             approval_id = secrets.token_urlsafe(18)

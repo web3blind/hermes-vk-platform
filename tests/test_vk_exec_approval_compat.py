@@ -76,6 +76,31 @@ async def test_approval_failure_keeps_text_fallback_available(callback_env, entr
     assert not result.success and not calls and not adapter._approval_state
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["legacy", "modern"])
+async def test_request_id_selects_exact_entry_and_never_falls_back(callback_env, entrypoint):
+    adapter, calls, approval = callback_env
+    first = _ApprovalEntry({"command": "touch demo", "description": "test", "request_id": "first"})
+    second = _ApprovalEntry({"command": "touch demo", "description": "test", "request_id": "second"})
+    approval._gateway_queues['s'] = [first, second]
+
+    async def send(request_id):
+        if entrypoint == 'legacy':
+            return await adapter.send_exec_approval(
+                '2000000042', 'touch demo', 's', 'test', request_id=request_id)
+        return await adapter._send_exec_approval_prompt(SimpleNamespace(
+            chat_id='2000000042', command='touch demo', session_key='s',
+            description='test', metadata=None, actions=[('Allow', 'once', '')],
+            smart_denied=False, text='Approve this request', request_id=request_id))
+
+    assert not (await send(None)).success  # Display text alone is ambiguous.
+    assert not (await send('missing')).success
+    assert not calls
+    assert (await send('second')).success
+    assert next(iter(adapter._approval_state.values()))['entry'] is second
+    assert not first.event.is_set() and not second.event.is_set()
+
+
 def test_gateway_dispatches_native_vk_approval(callback_env, monkeypatch):
     module = pytest.importorskip('gateway.run_turn_runner')
     if not hasattr(module, '_renders_exec_approval_buttons'):
@@ -86,7 +111,7 @@ def test_gateway_dispatches_native_vk_approval(callback_env, monkeypatch):
     approval._gateway_queues['s'] = [entry]
     ctx = SimpleNamespace(_status_adapter=adapter, _status_chat_id='2000000042',
                           session_key='s', _status_thread_metadata=None)
-    runner = module.TurnRunner(Mock(), ctx)
+    runner = module.TurnRunner(Mock(session_authorities=None, session_authority=None), ctx)
     monkeypatch.setattr(runner, '_close_native_stream_boundary', lambda *_: None)
     # Only replace the thread-to-event-loop bridge, not dispatch/rendering.
     def schedule(coro, *_):

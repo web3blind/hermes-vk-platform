@@ -21,6 +21,14 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Optional Telegram-style message-reaction acks (`VK_REACTIONS_ENABLED`): a progress reaction while the agent works, then 👍/👎 on completion.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
 
+## Changes in 0.2.8
+
+- Preserve connector access grants through native gateway admission and queued
+  message replay. On hosts supporting native reauthorization, the gateway checks
+  the receiving VK adapter's current access policy again; a saved role flag alone
+  never grants access. Both normal messages and pending-control replies request
+  the fresh check. Existing peer/user policies and mention requirements still apply.
+
 ## Changes in 0.2.7
 
 - History fallback starts at VK's authoritative conversation tail rather than

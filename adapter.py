@@ -2737,6 +2737,7 @@ class VKAdapter(BasePlatformAdapter):
                 logger.info("VK: ignoring duplicate edit event peer=%s cmid=%s", peer_id, conversation_message_id)
                 return
         if isinstance(invocation, MessageEvent):
+            invocation.source.role_authorized = True
             invocation.raw_message = update
             invocation.message_id = str(conversation_message_id) if conversation_message_id else None
             await self._dispatch_inbound(invocation)
@@ -2962,6 +2963,8 @@ class VKAdapter(BasePlatformAdapter):
             chat_topic=event_chat_topic,
             message_id=str(conversation_message_id) if conversation_message_id else None,
         )
+        # Request fresh connector-policy validation at native admission and replay.
+        source.role_authorized = True
         event = MessageEvent(
             text=text,
             message_type=media_type,
@@ -3421,6 +3424,10 @@ class VKAdapter(BasePlatformAdapter):
             return True
         self._seen_edit_keys[key] = now + self.dedupe_ttl_seconds
         return False
+
+    async def reauthorize_native_roles(self, source) -> bool:
+        """Recheck the receiving connector's current VK access policy."""
+        return self._is_authorized(from_id=source.user_id, peer_id=source.chat_id)
 
     def _is_authorized(self, *, from_id: str, peer_id: str) -> bool:
         if self.allow_all_users:

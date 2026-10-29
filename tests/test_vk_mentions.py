@@ -446,6 +446,10 @@ async def test_pending_plaintext_approval_matches_exact_lane(gated, monkeypatch,
     gated.handle_message.assert_awaited_once()
     event = gated.handle_message.await_args.args[0]
     assert event.text == command and gated._event_session_key(event) == key
+    assert event.source.role_authorized is True
+    assert await gated.reauthorize_native_roles(event.source) is True
+    gated.allowed_users_by_peer[PEER].discard("100")
+    assert await gated.reauthorize_native_roles(event.source) is False
     assert not entry.event.is_set(), "adapter must not resolve the core approval itself"
 
 

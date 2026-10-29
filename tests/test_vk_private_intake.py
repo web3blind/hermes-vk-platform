@@ -33,6 +33,10 @@ async def test_private_peer_override_restores_intake_and_logs_global_rejection(v
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_id == peer
+    assert event.source.role_authorized is True
+    assert await adapter.reauthorize_native_roles(event.source) is True
+    adapter.allowed_peers.remove(peer)
+    assert await adapter.reauthorize_native_roles(event.source) is False
     if voice:
         assert event.message_type.value in {"voice", "audio"}
         assert event.media_urls == ["/isolated/voice.ogg"]

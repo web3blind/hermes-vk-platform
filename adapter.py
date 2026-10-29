@@ -992,6 +992,7 @@ class VKAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._fallback_poll_task: Optional[asyncio.Task] = None
         self._fallback_last_cmid: dict[str, int] = {}
+        self._fallback_started_at = int(time.time())
         self._fallback_bootstrapped_logged = False
         self._lp_server = ""
         self._lp_key = ""
@@ -2477,25 +2478,20 @@ class VKAdapter(BasePlatformAdapter):
         items = response.get("items") if isinstance(response, dict) else []
         return [item for item in (items or []) if isinstance(item, dict)]
 
-    async def _cmid_exists(self, peer_id: str, cmid: int) -> bool:
-        try:
-            return bool(await self._fetch_cmid_items(peer_id, [cmid]))
-        except Exception as exc:
-            logger.debug("VK: fallback cmid probe failed peer=%s cmid=%s — %s", peer_id, cmid, _redact_token(str(exc)))
-            return False
-
     async def _discover_latest_cmid(self, peer_id: str) -> int:
-        high = 1
-        while high < 131072 and await self._cmid_exists(peer_id, high):
-            high *= 2
-        low = high // 2
-        while low + 1 < high:
-            mid = (low + high) // 2
-            if await self._cmid_exists(peer_id, mid):
-                low = mid
-            else:
-                high = mid
-        return low
+        # CMIDs can have holes (deleted/invisible messages); existence is not
+        # monotonic. Only VK's conversation tail is a safe startup watermark.
+        payload = await self._vk_method(
+            "messages.getConversationsById", {"peer_ids": str(peer_id), "extended": 0}
+        )
+        response = payload.get("response")
+        items = response.get("items", []) if isinstance(response, dict) else []
+        for item in items:
+            if str(item.get("peer", {}).get("id")) == str(peer_id):
+                cmid = item.get("last_conversation_message_id")
+                if type(cmid) is int and cmid >= 0:
+                    return cmid
+        raise ValueError("Authoritative VK conversation tail unavailable")
 
     async def _bootstrap_fallback_poll(self) -> None:
         for peer_id in self._fallback_peer_ids():
@@ -2521,7 +2517,10 @@ class VKAdapter(BasePlatformAdapter):
         handled = 0
         batch_size = max(1, min(int(self.fallback_poll_batch_size), 100))
         for peer_id in self._fallback_peer_ids():
-            last = int(self._fallback_last_cmid.get(peer_id, 0))
+            # Bootstrap failure must not turn into a history scan from zero.
+            if peer_id not in self._fallback_last_cmid:
+                continue
+            last = self._fallback_last_cmid[peer_id]
             ids = list(range(last + 1, last + batch_size + 1))
             try:
                 items = await self._fetch_cmid_items(peer_id, ids)
@@ -2533,7 +2532,10 @@ class VKAdapter(BasePlatformAdapter):
             max_seen = max(int(item.get("conversation_message_id") or 0) for item in items)
             self._fallback_last_cmid[peer_id] = max(last, max_seen)
             user_items = [
-                item for item in items if str(item.get("from_id") or "") and not str(item.get("from_id") or "").startswith("-")
+                item for item in items
+                if str(item.get("from_id") or "") and not str(item.get("from_id") or "").startswith("-")
+                # A stale tail must never turn old commands into live input.
+                if type(item.get("date")) is int and item["date"] >= self._fallback_started_at
             ]
             if user_items:
                 logger.info(
@@ -2544,10 +2546,7 @@ class VKAdapter(BasePlatformAdapter):
                     max(int(item.get("conversation_message_id") or 0) for item in user_items),
                     last,
                 )
-            for item in sorted(items, key=lambda msg: int(msg.get("conversation_message_id") or 0)):
-                from_id = str(item.get("from_id") or "")
-                if not from_id or from_id.startswith("-"):
-                    continue
+            for item in sorted(user_items, key=lambda msg: int(msg.get("conversation_message_id") or 0)):
                 cmid = item.get("conversation_message_id") or item.get("id")
                 if self._has_recent_message_key(peer_id=peer_id, conversation_message_id=cmid):
                     logger.info("VK: ignoring duplicate event peer=%s cmid=%s", peer_id, cmid)
@@ -2718,6 +2717,10 @@ class VKAdapter(BasePlatformAdapter):
 
         invocation = self._passes_invocation_gate(msg, peer_id, from_id)
         if not invocation:
+            logger.info(
+                "VK: ignoring unaddressed message peer=%s cmid=%s; mention or reply required",
+                peer_id, msg.get("conversation_message_id") or msg.get("id"),
+            )
             return
 
         conversation_message_id = msg.get("conversation_message_id") or msg.get("id")

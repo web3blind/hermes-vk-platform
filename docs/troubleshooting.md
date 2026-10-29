@@ -133,6 +133,37 @@ Access policies still apply to buttons. An allowlisted peer permits its allowed
 participants, not just the person who started a shared lane. Use `user_only`,
 `peer_and_user`, or per-peer user allowlists when approvals must be owner-only.
 
+### Text or voice is received but the agent does not answer
+
+Access control and invocation rules are separate. With `vk.require_mention: true`,
+ordinary messages in group conversations must mention the bot or reply to its
+message. A voice message with no text or reply does not pass that gate; it is
+rejected before download or speech recognition. Direct messages are not subject
+to the group mention gate.
+
+Version 0.2.7 logs this as `ignoring unaddressed message ...; mention or reply required`.
+The log contains identifiers, not message content. For a dedicated, already
+allowlisted conversation, an operator can disable only that peer's mention gate:
+
+```bash
+hermes config set vk.require_mention_by_peer.2000000042 false
+```
+
+Replace the example peer with the intended conversation. Preserve existing
+per-peer settings, then restart the gateway deliberately. This does not grant
+access to unauthorized senders or change other conversations' mention rules.
+Verify with newly sent text and voice, not by replaying historical messages.
+
+### Old messages appear after startup
+
+Update to 0.2.7 or newer. Earlier fallback initialization assumed message IDs had
+no gaps and could choose an old cursor when messages were deleted or invisible.
+The repaired fallback uses `messages.getConversationsById` and the matching peer's
+`last_conversation_message_id`. When that tail is unavailable, only that peer's
+fallback waits and retries; Group Long Poll remains independent. Never reset the
+cursor to zero as a workaround. Messages older than adapter startup, including
+commands, are not dispatched by fallback.
+
 ### Media does not arrive as expected
 
 Some VK attachments expose only player/watch-page metadata. The plugin does not pretend those pages are direct files.

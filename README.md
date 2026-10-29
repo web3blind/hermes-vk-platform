@@ -21,6 +21,20 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Optional Telegram-style message-reaction acks (`VK_REACTIONS_ENABLED`): a progress reaction while the agent works, then 👍/👎 on completion.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
 
+## Changes in 0.2.7
+
+- History fallback starts at VK's authoritative conversation tail rather than
+  guessing the last message ID. Deleted or invisible messages cannot rewind it.
+- If the tail is unavailable, fallback waits and retries without reading from
+  zero. It never dispatches fallback messages dated before adapter startup or
+  with an invalid/missing timestamp. This also prevents old commands from replaying.
+- Mention-gate rejections are logged with peer/message IDs only, not message text.
+  Existing mention rules and access policies remain unchanged. See
+  [troubleshooting](docs/troubleshooting.md#text-or-voice-is-received-but-the-agent-does-not-answer).
+
+Restart the gateway after updating. Fallback does not recover messages sent
+before its startup watermark; send a fresh message to verify text and voice.
+
 ## Plugin callback API (0.2.6)
 
 Any plugin can register an isolated callback namespace on a live `VKAdapter`:

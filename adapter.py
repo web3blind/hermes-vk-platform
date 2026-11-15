@@ -675,6 +675,12 @@ def _is_retryable_vk_error(exc: Exception) -> bool:
     upload URL, malformed response, or local validation errors.
     """
     text = str(exc).lower()
+    # VK photo-upload endpoints intermittently answer error 100
+    # "photo is undefined" or a bare HTTP 500 for a file/peer that succeeds
+    # moments later; treat only those two shapes as transient, even though a
+    # genuine error 100 (invalid parameter) stays permanent.
+    if "photo is undefined" in text or "internal server error" in text:
+        return True
     retryable_markers = (
         "unknown error",
         "timed out",
@@ -705,6 +711,10 @@ def _is_retryable_vk_error(exc: Exception) -> bool:
     return any(marker in text for marker in retryable_markers) and not any(
         marker in text for marker in non_retryable_markers
     )
+
+
+VK_PHOTO_UPLOAD_MIN_GAP_SECONDS = 1.5
+_VK_LAST_PHOTO_UPLOAD_AT = 0.0
 
 
 async def _retry_vk_transient_once(label: str, operation):
@@ -3721,6 +3731,15 @@ class VKAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
 
     async def _upload_photo_attachment(self, chat_id: str, image_path: str) -> str:
+        global _VK_LAST_PHOTO_UPLOAD_AT
+        # VK's upload endpoints degrade under back-to-back photo uploads
+        # (observed: 3 of 5 images lost in one burst).  Pace consecutive
+        # uploads a little even within one multi-attachment message.
+        gap = VK_PHOTO_UPLOAD_MIN_GAP_SECONDS - (time.monotonic() - _VK_LAST_PHOTO_UPLOAD_AT)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        _VK_LAST_PHOTO_UPLOAD_AT = time.monotonic()
+
         async def op():
             server = await self._vk_method("photos.getMessagesUploadServer", {"peer_id": str(chat_id)})
             upload_url = (server.get("response") or {}).get("upload_url")

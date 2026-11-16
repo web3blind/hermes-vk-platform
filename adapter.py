@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -707,11 +708,36 @@ def _is_retryable_vk_error(exc: Exception) -> bool:
     )
 
 
-async def _retry_vk_transient_once(label: str, operation):
+VK_PHOTO_UPLOAD_MIN_GAP_SECONDS = 1.5
+
+
+def _is_retryable_photo_upload_error(exc: Exception) -> bool:
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError, ValueError)):
+        return False
+    text = str(exc).lower()
+    # This is the sole invalid-parameter exception: no mixed auth/validation
+    # message may become retryable just because it mentions a photo failure.
+    if re.fullmatch(
+        r"vk api error 100: (?:one of the parameters specified was missing or invalid: )?photo is undefined",
+        text.strip(),
+    ):
+        return True
+    permanent = (
+        "vk api error 5:", "vk api error 7:", "vk api error 15:",
+        "vk api error 100:", "authorization", "permission", "access denied",
+        "missing upload_url", "missing owner_id/id", "non-json response",
+        "too large", "exceeded size limit",
+    )
+    if any(marker in text for marker in permanent):
+        return False
+    return "internal server error" in text or _is_retryable_vk_error(exc)
+
+
+async def _retry_vk_transient_once(label: str, operation, *, is_retryable=_is_retryable_vk_error):
     try:
         return await operation()
     except Exception as exc:
-        if not _is_retryable_vk_error(exc):
+        if not is_retryable(exc):
             raise
         logger.warning(
             "VK: transient %s failed (%s); retrying once in %.0fs",
@@ -891,6 +917,7 @@ class VKAdapter(BasePlatformAdapter):
 
     def __init__(self, config, **_: Any) -> None:
         super().__init__(config=config, platform=Platform("vk"))
+        self._photo_upload_pacing = weakref.WeakKeyDictionary()
         extra = getattr(config, "extra", {}) or {}
 
         self.token = _getenv("VK_GROUP_TOKEN") or getattr(config, "token", None) or extra.get("group_token", "")
@@ -3702,13 +3729,14 @@ class VKAdapter(BasePlatformAdapter):
     async def _send_attachment(self, chat_id: str, attachment: str, caption: Optional[str] = None) -> SendResult:
         try:
             default_keyboard = self._persistent_project_keyboard(chat_id) if self._should_attach_project_keyboard(chat_id) else None
+            random_id = random.randint(1, 2_147_483_647)
 
             async def op():
                 params = {
                     "peer_ids": str(chat_id),
                     "message": caption or "",
                     "attachment": attachment,
-                    "random_id": random.randint(1, 2_147_483_647),
+                    "random_id": random_id,
                 }
                 if default_keyboard:
                     params["keyboard"] = default_keyboard
@@ -3720,8 +3748,24 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             return SendResult(success=False, error=_redact_token(str(exc)), retryable=True)
 
+    async def _pace_photo_upload(self) -> None:
+        # Adapter/loop-local state avoids coupling profiles or binding a lock to
+        # a previous event loop. Cancelled waiters do not reserve future slots.
+        loop = asyncio.get_running_loop()
+        state = self._photo_upload_pacing.get(loop)
+        if state is None:
+            state = [asyncio.Lock(), None]
+            self._photo_upload_pacing[loop] = state
+        async with state[0]:
+            if state[1] is not None:
+                gap = VK_PHOTO_UPLOAD_MIN_GAP_SECONDS - (time.monotonic() - state[1])
+                if gap > 0:
+                    await asyncio.sleep(gap)
+            state[1] = time.monotonic()
+
     async def _upload_photo_attachment(self, chat_id: str, image_path: str) -> str:
         async def op():
+            await self._pace_photo_upload()
             server = await self._vk_method("photos.getMessagesUploadServer", {"peer_id": str(chat_id)})
             upload_url = (server.get("response") or {}).get("upload_url")
             if not upload_url:
@@ -3733,7 +3777,7 @@ class VKAdapter(BasePlatformAdapter):
                 raise RuntimeError("VK photo save response is empty")
             return self._format_attachment_ref("photo", photos[0])
 
-        return await _retry_vk_transient_once("photo upload", op)
+        return await _retry_vk_transient_once("photo upload", op, is_retryable=_is_retryable_photo_upload_error)
 
     async def _upload_doc_attachment(self, chat_id: str, file_path: str, *, doc_type: Optional[str] = None) -> str:
         async def op():
@@ -4028,11 +4072,12 @@ class VKAdapter(BasePlatformAdapter):
         continuation_ids: list[str] = []
         try:
             for chunk in chunks:
-                async def op(chunk=chunk):
+                random_id = random.randint(1, 2_147_483_647)
+                async def op(chunk=chunk, random_id=random_id):
                     params = {
                         "peer_ids": str(chat_id),
                         "message": chunk,
-                        "random_id": random.randint(1, 2_147_483_647),
+                        "random_id": random_id,
                     }
                     if default_keyboard:
                         params["keyboard"] = default_keyboard

@@ -4,6 +4,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
+# Subprocess imports exercise gateway contracts, never runtime provisioning.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+
 _SCRATCH = Path(os.environ.get("TMPDIR") or Path.home() / ".hermes/cache/scratch")
 _SCRATCH.mkdir(parents=True, exist_ok=True)
 _ROOT = Path(tempfile.mkdtemp(prefix="vk-public-tests-", dir=_SCRATCH))

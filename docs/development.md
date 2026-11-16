@@ -114,6 +114,24 @@ Important rules:
 
 Outbound remote image URLs are sent as text URLs. Local image files use the VK message photo upload flow.
 
+Photo upload attempts (including retries) start at least 1.5 seconds apart
+within one adapter and event loop. Concurrent callers share that pacing gate;
+cancelling a waiter releases it without reserving a slot. Separate adapters and
+event loops do not share pacing state.
+
+The photo flow retries once after the existing transient-retry delay for
+`Internal Server Error` and the exact VK error 100 `photo is undefined` (also
+with VK's standard invalid-parameter prefix). Other auth, permission, validation,
+malformed-response and size-limit errors remain permanent, including mixed error
+messages. These additional retry triggers do not apply to text sends, documents,
+videos or other VK operations; their existing transient classification is unchanged.
+
+Every text chunk and attachment send generates its `random_id` once before its
+retry closure. Retrying the same logical send reuses the ID; subsequent sends and
+chunks generate fresh IDs. Keyboard selection, access policies and project routing
+are unchanged. These guarantees are covered offline in
+`tests/test_vk_outbound_reliability.py`.
+
 ## Testing
 
 From this plugin repository, use:

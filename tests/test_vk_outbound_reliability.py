@@ -102,13 +102,15 @@ def test_photo_local_validation_with_transient_words_is_not_retried(adapter, mon
 
 def test_photo_retry_is_bounded_and_failure_does_not_poison_pacing(adapter, monkeypatch, clock):
     error = "HTTP Error 500: Internal Server Error"
-    starts = photo_transport(adapter, monkeypatch, [error, error])
+    # Photo uploads allow two retries (three attempts), so exhausting the
+    # bound needs three queued failures before the give-up is observable.
+    starts = photo_transport(adapter, monkeypatch, [error, error, error])
     async def scenario():
         with pytest.raises(RuntimeError, match=error):
             await adapter._upload_photo_attachment("123456", "bad.png")
         assert await adapter._upload_photo_attachment("123456", "good.png") == "photo1_2"
     asyncio.run(scenario())
-    assert starts == [100, 101.5, 103]
+    assert starts == [100, 101.5, 103, 104.5]
 
 
 def test_generic_send_does_not_gain_photo_retry_triggers(adapter, monkeypatch, clock):

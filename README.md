@@ -15,7 +15,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Message editing for Hermes tool-progress bubbles through `messages.edit`.
 - Inbound media handling for photos, documents, voice messages, audio, video messages, and direct video files with bounded downloads.
 - Outbound media upload for image files, documents, voice files, and videos.
-- Local photo uploads are paced and retry transient failures once; text chunks
+- Local photo uploads are paced and retry transient failures up to twice; text chunks
   and attachment sends reuse their VK `random_id` on retries to avoid duplicates.
 - If VK `video.save` rejects an MP4 with auth/permission errors under group-token auth, video delivery falls back to sending the MP4 as a document attachment.
 - Markdown-style Hermes output is converted to VK-readable plain text because the regular VK `messages.send` API has no Telegram-like `parse_mode` for Markdown/HTML.

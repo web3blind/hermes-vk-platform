@@ -119,12 +119,18 @@ within one adapter and event loop. Concurrent callers share that pacing gate;
 cancelling a waiter releases it without reserving a slot. Separate adapters and
 event loops do not share pacing state.
 
-The photo flow retries once after the existing transient-retry delay for
-`Internal Server Error` and the exact VK error 100 `photo is undefined` (also
-with VK's standard invalid-parameter prefix). Other auth, permission, validation,
-malformed-response and size-limit errors remain permanent, including mixed error
-messages. These additional retry triggers do not apply to text sends, documents,
-videos or other VK operations; their existing transient classification is unchanged.
+The photo flow allows up to two retries (three attempts), with a five-second
+wait before each retry, for existing transient errors, `Internal Server Error`,
+`HTTP Error 405`, and the exact VK error 100 `photo is undefined` (also with VK's
+standard invalid-parameter prefix). The policy covers the entire photo flow:
+requesting an upload server, uploading the file, and saving the photo. It is not
+restricted to a multipart endpoint or a 405 immediately following a 500.
+Other auth, permission, validation, malformed-response and size-limit errors
+remain permanent, including mixed error messages. Text sends, documents, videos
+and other VK operations retain their existing transient classification and
+single retry. A persistent HTTP 405 still fails after the bounded attempts;
+the retry policy assumes a temporary VK-side failure, not that every 405 is
+recoverable.
 
 Every text chunk and attachment send generates its `random_id` once before its
 retry closure. Retrying the same logical send reuses the ID; subsequent sends and

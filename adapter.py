@@ -730,23 +730,33 @@ def _is_retryable_photo_upload_error(exc: Exception) -> bool:
     )
     if any(marker in text for marker in permanent):
         return False
-    return "internal server error" in text or _is_retryable_vk_error(exc)
+    # A bare HTTP 405 from the upload endpoint has been observed right after
+    # an HTTP 500 for a file that succeeds moments later; treat it as the
+    # same transient upload-endpoint shape.
+    return ("internal server error" in text
+            or "http error 405" in text
+            or _is_retryable_vk_error(exc))
 
 
-async def _retry_vk_transient_once(label: str, operation, *, is_retryable=_is_retryable_vk_error):
-    try:
-        return await operation()
-    except Exception as exc:
-        if not is_retryable(exc):
-            raise
-        logger.warning(
-            "VK: transient %s failed (%s); retrying once in %.0fs",
-            label,
-            _redact_token(str(exc)),
-            VK_TRANSIENT_RETRY_DELAY_SECONDS,
-        )
-        await asyncio.sleep(VK_TRANSIENT_RETRY_DELAY_SECONDS)
-        return await operation()
+async def _retry_vk_transient_once(
+    label: str, operation, *, is_retryable=_is_retryable_vk_error, retries: int = 1
+):
+    attempts = retries + 1
+    for attempt in range(attempts):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not is_retryable(exc) or attempt == attempts - 1:
+                raise
+            logger.warning(
+                "VK: transient %s failed (%s); retrying (%d/%d) in %.0fs",
+                label,
+                _redact_token(str(exc)),
+                attempt + 1,
+                retries,
+                VK_TRANSIENT_RETRY_DELAY_SECONDS,
+            )
+            await asyncio.sleep(VK_TRANSIENT_RETRY_DELAY_SECONDS)
 
 
 def _download_attachment(
@@ -3777,7 +3787,9 @@ class VKAdapter(BasePlatformAdapter):
                 raise RuntimeError("VK photo save response is empty")
             return self._format_attachment_ref("photo", photos[0])
 
-        return await _retry_vk_transient_once("photo upload", op, is_retryable=_is_retryable_photo_upload_error)
+        return await _retry_vk_transient_once(
+            "photo upload", op, is_retryable=_is_retryable_photo_upload_error, retries=2
+        )
 
     async def _upload_doc_attachment(self, chat_id: str, file_path: str, *, doc_type: Optional[str] = None) -> str:
         async def op():

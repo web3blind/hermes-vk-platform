@@ -102,13 +102,86 @@ def test_photo_local_validation_with_transient_words_is_not_retried(adapter, mon
 
 def test_photo_retry_is_bounded_and_failure_does_not_poison_pacing(adapter, monkeypatch, clock):
     error = "HTTP Error 500: Internal Server Error"
-    starts = photo_transport(adapter, monkeypatch, [error, error])
+    # Photo uploads allow two retries (three attempts), so exhausting the
+    # bound needs three queued failures before the give-up is observable.
+    starts = photo_transport(adapter, monkeypatch, [error, error, error])
     async def scenario():
         with pytest.raises(RuntimeError, match=error):
             await adapter._upload_photo_attachment("123456", "bad.png")
         assert await adapter._upload_photo_attachment("123456", "good.png") == "photo1_2"
     asyncio.run(scenario())
-    assert starts == [100, 101.5, 103]
+    assert starts == [100, 101.5, 103, 104.5]
+
+
+@pytest.mark.parametrize("stage", ["server", "upload", "save"])
+@pytest.mark.parametrize("errors", [
+    ["HTTP Error 405: Not Allowed"],
+    ["HTTP Error 500: Internal Server Error", "HTTP Error 405: Not Allowed"],
+])
+def test_photo_405_recovers_with_production_retry_delay(adapter, monkeypatch, clock, stage, errors):
+    monkeypatch.setattr(vk, "VK_TRANSIENT_RETRY_DELAY_SECONDS", 5.0)
+    starts = photo_transport(adapter, monkeypatch, errors, stage)
+    assert asyncio.run(adapter._upload_photo_attachment("123456", "image.png")) == "photo1_2"
+    assert starts == [100 + 5 * i for i in range(len(errors) + 1)]
+    assert clock.sleeps == [5.0] * len(errors)
+
+
+@pytest.mark.parametrize("error", [
+    "VK API error 5: authorization failed HTTP Error 405",
+    "VK API error 7: permission denied HTTP Error 405",
+    "VK API error 15: access denied HTTP Error 405",
+    "VK API error 100: invalid parameter HTTP Error 405",
+    "missing upload_url HTTP Error 405",
+    "missing owner_id/id HTTP Error 405",
+    "non-json response HTTP Error 405",
+    "exceeded size limit HTTP Error 405",
+])
+def test_photo_permanent_405_is_not_retried(adapter, monkeypatch, clock, error):
+    starts = photo_transport(adapter, monkeypatch, [error])
+    with pytest.raises(RuntimeError, match=error):
+        asyncio.run(adapter._upload_photo_attachment("123456", "image.png"))
+    assert starts == [100]
+    assert clock.sleeps == []
+
+
+def test_photo_405_exhaustion_propagates_and_recovers(adapter, monkeypatch, clock):
+    error = "HTTP Error 405: Not Allowed"
+    starts = photo_transport(adapter, monkeypatch, [error] * 3)
+    async def scenario():
+        with pytest.raises(RuntimeError, match=error):
+            await adapter._upload_photo_attachment("123456", "bad.png")
+        assert await adapter._upload_photo_attachment("123456", "good.png") == "photo1_2"
+    asyncio.run(scenario())
+    assert starts == [100, 101.5, 103, 104.5]
+
+
+@pytest.mark.parametrize("operation", ["text", "attachment", "doc", "video"])
+def test_other_operations_do_not_gain_405_retries(adapter, monkeypatch, clock, operation):
+    method = AsyncMock(side_effect=RuntimeError("HTTP Error 405: Not Allowed"))
+    monkeypatch.setattr(adapter, "_vk_method", method)
+    async def scenario():
+        if operation == "text":
+            assert not (await adapter.send("123456", "hello")).success
+        elif operation == "attachment":
+            assert not (await adapter._send_attachment("123456", "photo1_2")).success
+        else:
+            upload = adapter._upload_doc_attachment if operation == "doc" else adapter._upload_video_attachment
+            with pytest.raises(RuntimeError, match="405"):
+                await upload("123456", "file.bin")
+    asyncio.run(scenario())
+    assert method.await_count == 1
+    assert clock.sleeps == []
+
+
+def test_default_retry_bound_and_production_delay(monkeypatch):
+    operation = AsyncMock(side_effect=RuntimeError("connection reset"))
+    sleep = AsyncMock()
+    monkeypatch.setattr(vk.asyncio, "sleep", sleep)
+    monkeypatch.setattr(vk, "VK_TRANSIENT_RETRY_DELAY_SECONDS", 5.0)
+    with pytest.raises(RuntimeError, match="connection reset"):
+        asyncio.run(vk._retry_vk_transient_once("test", operation))
+    assert operation.await_count == 2
+    sleep.assert_awaited_once_with(5.0)
 
 
 def test_generic_send_does_not_gain_photo_retry_triggers(adapter, monkeypatch, clock):

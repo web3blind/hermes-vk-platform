@@ -21,7 +21,24 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Markdown-style Hermes output is converted to VK-readable plain text because the regular VK `messages.send` API has no Telegram-like `parse_mode` for Markdown/HTML.
 - Optional per-channel prompts and skill bindings through Hermes config.
 - Optional Telegram-style message-reaction acks (`VK_REACTIONS_ENABLED`): a progress reaction while the agent works, then 👍/👎 on completion.
+- Inbound user reactions surface as short `[VK reaction]` notes (`VK_REACTION_INBOUND`), deduplicated and tolerant of VK's reaction-index lag.
+- Inbound stickers arrive as native images: inline `photo`/`images` sizes when present, VK's static sticker CDN otherwise. Animated stickers deliver as their first frame.
+- Inbound attachment downloads retry once on transient CDN drops ("Remote end closed connection") before falling back to the raw URL.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
+
+## Changes in 0.2.9
+
+- Inbound reactions: `message_reply` events are re-read via
+  `messages.getByConversationMessageId` (escalating ~50 s window, because the
+  VK reaction index lags the event by tens of seconds) and only new user
+  reactions surface, as one `[VK reaction] …` text event per change.
+  Community acks and reaction removals stay silent; failures never break
+  intake. Toggle with `VK_REACTION_INBOUND` (default on).
+- Inbound stickers resolve to a usable image URL via nested `photo`,
+  `images_with_background`/`images` (largest wins), or the
+  `https://vk.ru/sticker/1-{sticker_id}-512b` CDN pattern.
+- Inbound attachment materialization retries once (1 s apart) after a
+  transient download drop, mirroring the outbound retry policy.
 
 ## Changes in 0.2.8
 
@@ -439,6 +456,23 @@ final outcomes). On cancelled/interrupted turns the progress reaction is
 removed. Requires the community token to have the messages permission; some
 very old API versions do not expose `messages.deleteReaction` — the adapter
 probes support lazily and degrades gracefully.
+
+### Inbound reactions (user → agent)
+
+Outbound acks above are cosmetic for the user. The reverse direction is
+opt-out: by default the adapter also reports reactions *users* put on the
+bot's messages, so the agent can see a ❤️/👍 as a lightweight reply. The raw
+`message_reply` event does not carry the react itself, so the adapter
+re-reads the message with escalating waits (VK's reaction index has been
+observed to lag 20–40 s). Each newly-added (user, reaction) pair surfaces
+once as a `[VK reaction] …` text event; the community's own ack reactions
+and reaction removals stay silent, and only reactors passing the normal
+access policy are reported.
+
+```dotenv
+# Default shown; set false to keep reactions invisible to the agent:
+VK_REACTION_INBOUND=true
+```
 
 ## Optional YAML config
 

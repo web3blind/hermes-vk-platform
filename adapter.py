@@ -66,6 +66,9 @@ DOWNLOADABLE_MIME_PREFIXES = ("image/", "video/", "audio/", "application/pdf", "
 _VK_REACTION_OK = 4  # 👍
 _VK_REACTION_FAIL = 8  # override via VK_REACTION_FAIL if the community map differs
 _VK_REACTION_PROGRESS_DEFAULT = 10  # 👌 — "seen, working on it"
+# Default community reaction id -> emoji (same default set as above), used to
+# describe INBOUND reactions to the agent.
+_VK_REACTION_EMOJI = {1: "❤️", 2: "🔥", 3: "😂", 4: "👍", 8: "😡", 10: "👌", 16: "🎉"}
 
 
 def _truthy(value: Any) -> bool:
@@ -1005,6 +1008,13 @@ class VKAdapter(BasePlatformAdapter):
             _getenv("VK_REACTION_FAIL") or extra.get("reaction_fail"), _VK_REACTION_FAIL
         )
         self._delete_reaction_supported: Optional[bool] = None
+        # Surface inbound user reactions as agent-visible events (default on;
+        # VK_REACTION_INBOUND=false disables). Tracks the last (user_id,
+        # reaction_id) set per message so re-polls and removals never re-report.
+        self.reaction_inbound_enabled = _truthy(
+            _getenv("VK_REACTION_INBOUND") if _getenv("VK_REACTION_INBOUND") is not None else "true"
+        )
+        self._reaction_seen: dict[tuple[str, str], frozenset] = {}
 
         self.fallback_poll_enabled = _truthy(_getenv("VK_FALLBACK_POLL_ENABLED") or extra.get("fallback_poll_enabled") or "true")
         self.fallback_poll_interval_seconds = _parse_positive_int(
@@ -2622,6 +2632,15 @@ class VKAdapter(BasePlatformAdapter):
             await asyncio.sleep(0)
             return
         if update_type not in {"message_new", "message_edit"}:
+            if update_type == "message_reply" and self.reaction_inbound_enabled:
+                # VK sends `message_reply` when a reaction is added/removed on a
+                # message (anyone's, ours included). The event object carries no
+                # react field, so resolve real state via the API and surface
+                # user additions as a small text event.
+                self._track_intake(
+                    asyncio.create_task(self._surface_reaction(update), name="vk-reaction"),
+                    "",
+                )
             return
         # Long Poll and fallback may overlap during API enrichment. Preserve
         # arrival order through route selection only, never through download.
@@ -2737,6 +2756,78 @@ class VKAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("VK: unable to check pending clarify; requiring an explicit invocation")
             return False
+
+    async def _surface_reaction(self, update: dict[str, Any]) -> None:
+        """Turn a `message_reply` (reaction) event into a small visible note.
+
+        VK's event object omits the react itself, so re-read the message via
+        ``messages.getByConversationMessageId`` (which returns ``reactions``
+        with user_ids) and report only NEW positive-user (uid > 0) reactions —
+        our own numeric ack reactions (community, uid < 0) and removals stay
+        silent. Failures are logged and swallowed; reactions must never break
+        intake.
+        """
+        try:
+            obj = update.get("object") or {}
+            peer_id = str(obj.get("peer_id") or "")
+            cmid = obj.get("conversation_message_id") or obj.get("id")
+            if not peer_id or not cmid:
+                return
+            # VK lags the reaction index well behind the event (observed 20-40s
+            # on the read path!), so poll escalating steps up to ~50s.
+            reactions = None
+            for delay in (0, 2, 5, 8, 15, 20):
+                if delay:
+                    await asyncio.sleep(delay)
+                payload = await self._vk_method(
+                    "messages.getByConversationMessageId",
+                    {"peer_id": peer_id, "conversation_message_ids": str(cmid)},
+                )
+                items = ((payload or {}).get("response") or {}).get("items") or []
+                reactions = items[0].get("reactions") if items else None
+                if reactions:
+                    break
+            logger.debug(
+                "VK: reaction probe cmid=%s raw=%r", cmid,
+                json.dumps(reactions, ensure_ascii=False) if reactions else None,
+            )
+            current = frozenset(
+                (str(uid), int(r.get("reaction_id") or 0))
+                for r in (reactions or [])
+                for uid in (r.get("user_ids") or [])
+                if int(uid) > 0
+            )
+            key = (peer_id, str(cmid))
+            added = current - self._reaction_seen.get(key, frozenset())
+            self._reaction_seen[key] = current
+            if not added:
+                return
+            reactor = sorted(added)[0][0]
+            if not self._is_authorized(from_id=reactor, peer_id=peer_id):
+                logger.info("VK: ignoring reaction from unauthorized user=%s peer=%s", reactor, peer_id)
+                return
+            parts = ", ".join(
+                f"{_VK_REACTION_EMOJI.get(rid, f'reaction_id={rid}')} by user {uid}"
+                for uid, rid in sorted(added)
+            )
+            logger.info("VK: inbound reaction on cmid=%s: %s", cmid, parts)
+            source = self.build_source(
+                chat_id=peer_id,
+                chat_type="dm" if not peer_id.startswith("-") else "group",
+                user_id=reactor,
+                message_id=str(cmid),
+            )
+            source.role_authorized = True
+            event = MessageEvent(
+                text=f"[VK reaction] Реакция на сообщение #{cmid}: {parts}",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=update,
+                message_id=str(cmid),
+            )
+            await self._dispatch_inbound(event)
+        except Exception as exc:
+            logger.warning("VK: reaction surfacing failed safely — %s", _redact_token(str(exc)))
 
     async def _handle_message_update(self, update: dict[str, Any]) -> None:
         update_type = str(update.get("type") or "")
@@ -3407,7 +3498,19 @@ class VKAdapter(BasePlatformAdapter):
                 continue
             try:
                 async with self._download_semaphore:
-                    materialized.append(await _download_attachment_async(url, media_type, max_bytes=self.max_attachment_bytes))
+                    attempts = 2
+                    for attempt in range(attempts):
+                        try:
+                            materialized.append(await _download_attachment_async(url, media_type, max_bytes=self.max_attachment_bytes))
+                            break
+                        except Exception as exc:
+                            # VK's CDN intermittently drops keep-alive sockets
+                            # ("Remote end closed connection"); one bounded
+                            # retry absorbs it (mirrors the send-side policy).
+                            if attempt + 1 >= attempts:
+                                raise
+                            logger.info("VK: inbound attachment download failed (%s); retrying once", _redact_token(str(exc)))
+                            await asyncio.sleep(1)
             except Exception as exc:
                 logger.warning("VK: failed to download inbound attachment — %s", _redact_token(str(exc)))
                 materialized.append(url)
@@ -3515,6 +3618,21 @@ class VKAdapter(BasePlatformAdapter):
             return str(payload.get("link_ogg") or payload.get("link_mp3") or "")
         if kind == "video_message":
             return str(payload.get("link_mp4") or payload.get("link") or "")
+        if kind == "sticker":
+            photo = payload.get("photo")
+            if isinstance(photo, dict):
+                return VKAdapter._attachment_url("photo", photo)
+            # Newer API versions omit `photo` but ship `images*` size lists.
+            images = payload.get("images_with_background") or payload.get("images") or []
+            if isinstance(images, list) and images:
+                best = max(images, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+                return str(best.get("url") or "")
+            sticker_id = payload.get("sticker_id")
+            if sticker_id:
+                # VK's own legacy image URLs use the "1-{sticker_id}-{size}b"
+                # asset pattern; live-verified 22.11 for static stickers.
+                return f"https://vk.ru/sticker/1-{sticker_id}-512b"
+            logger.info("VK: sticker payload has no photo/images; keys=%s", sorted(payload.keys()))
         return ""
 
     @staticmethod
@@ -3545,6 +3663,9 @@ class VKAdapter(BasePlatformAdapter):
                 if guessed:
                     return guessed
             return "application/octet-stream"
+        if kind == "sticker" and (isinstance(payload.get("photo"), dict) or payload.get("images_with_background")
+                                  or payload.get("images") or payload.get("sticker_id")):
+            return "image/jpeg"
         return ""
 
     @staticmethod
@@ -3563,6 +3684,9 @@ class VKAdapter(BasePlatformAdapter):
             if payload.get("type") == 5 or payload.get("ext") in {"ogg", "opus"}:
                 return MessageType.VOICE
             return MessageType.DOCUMENT
+        if kind == "sticker" and (payload.get("photo") or payload.get("images_with_background")
+                                  or payload.get("images") or payload.get("sticker_id")):
+            return MessageType.PHOTO
         return MessageType.TEXT
 
     def _summarize_forwarded_messages(self, msg: dict[str, Any]) -> str:

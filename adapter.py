@@ -3950,7 +3950,7 @@ class VKAdapter(BasePlatformAdapter):
             return self._format_attachment_ref("photo", photos[0])
 
         return await _retry_vk_transient_once(
-            "photo upload", op, is_retryable=_is_retryable_photo_upload_error, retries=2
+            "photo upload", op, is_retryable=_is_retryable_photo_upload_error, retries=3
         )
 
     async def _upload_doc_attachment(self, chat_id: str, file_path: str, *, doc_type: Optional[str] = None) -> str:

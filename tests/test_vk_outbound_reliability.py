@@ -126,6 +126,36 @@ def test_photo_405_recovers_with_production_retry_delay(adapter, monkeypatch, cl
     assert clock.sleeps == [5.0] * len(errors)
 
 
+@pytest.mark.parametrize("stage", ["server", "upload", "save"])
+def test_photo_recovers_on_fourth_attempt_with_production_delays(adapter, monkeypatch, clock, stage):
+    monkeypatch.setattr(vk, "VK_TRANSIENT_RETRY_DELAY_SECONDS", 5.0)
+    starts = photo_transport(adapter, monkeypatch, [
+        "HTTP Error 500: Internal Server Error",
+        "HTTP Error 405: Not Allowed",
+        "VK API error 100: photo is undefined",
+    ], stage)
+    assert asyncio.run(adapter._upload_photo_attachment("123456", "image.png")) == "photo1_2"
+    assert starts == [100, 105, 110, 115]
+    assert clock.sleeps == [5.0, 5.0, 5.0]
+
+
+def test_photo_cancel_during_third_retry_does_not_start_fourth_attempt(adapter, monkeypatch, clock):
+    error = "HTTP Error 500: Internal Server Error"
+    starts = photo_transport(adapter, monkeypatch, [error] * 4)
+    delays = []
+    async def cancel_third_wait(delay):
+        delays.append(delay)
+        if len(delays) == 3:
+            raise asyncio.CancelledError()
+        clock.now += delay
+    monkeypatch.setattr(vk.asyncio, "sleep", cancel_third_wait)
+    monkeypatch.setattr(vk, "VK_TRANSIENT_RETRY_DELAY_SECONDS", 5.0)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter._upload_photo_attachment("123456", "image.png"))
+    assert starts == [100, 105, 110]
+    assert delays == [5.0, 5.0, 5.0]
+
+
 @pytest.mark.parametrize("error", [
     "VK API error 5: authorization failed HTTP Error 405",
     "VK API error 7: permission denied HTTP Error 405",

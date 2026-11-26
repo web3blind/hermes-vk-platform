@@ -119,8 +119,9 @@ within one adapter and event loop. Concurrent callers share that pacing gate;
 cancelling a waiter releases it without reserving a slot. Separate adapters and
 event loops do not share pacing state.
 
-The photo flow allows up to two retries (three attempts), with a five-second
-wait before each retry, for existing transient errors, `Internal Server Error`,
+The photo flow allows up to three retries (four attempts), with a five-second
+wait before each retry (up to 15 seconds of retry waits, plus network time), for
+existing transient errors, `Internal Server Error`,
 `HTTP Error 405`, and the exact VK error 100 `photo is undefined` (also with VK's
 standard invalid-parameter prefix). The policy covers the entire photo flow:
 requesting an upload server, uploading the file, and saving the photo. It is not

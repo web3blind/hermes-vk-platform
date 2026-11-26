@@ -15,7 +15,7 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Message editing for Hermes tool-progress bubbles through `messages.edit`.
 - Inbound media handling for photos, documents, voice messages, audio, video messages, and direct video files with bounded downloads.
 - Outbound media upload for image files, documents, voice files, and videos.
-- Local photo uploads are paced and retry transient failures up to twice; text chunks
+- Local photo uploads are paced and retry transient failures up to three times; text chunks
   and attachment sends reuse their VK `random_id` on retries to avoid duplicates.
 - If VK `video.save` rejects an MP4 with auth/permission errors under group-token auth, video delivery falls back to sending the MP4 as a document attachment.
 - Markdown-style Hermes output is converted to VK-readable plain text because the regular VK `messages.send` API has no Telegram-like `parse_mode` for Markdown/HTML.
@@ -25,6 +25,13 @@ This plugin lets Hermes receive messages from VK community messages via **VK Gro
 - Inbound stickers arrive as native images: inline `photo`/`images` sizes when present, VK's static sticker CDN otherwise. Animated stickers deliver as their first frame.
 - Inbound attachment downloads retry once on transient CDN drops ("Remote end closed connection") before falling back to the raw URL.
 - No mandatory third-party Python dependency; the adapter uses Python stdlib for VK HTTP calls.
+
+## Changes in 0.2.11
+
+- Photo upload transient retries raised from two to three (four attempts, 5 s apart).
+  Observed in production: a VK upload-endpoint flake window longer than ~12 s exhausted
+  both retries, so the message text shipped without its photo; a wider bound absorbs
+  bursts of that length while keeping the give-up bounded and non-poisoning for pacing.
 
 ## Changes in 0.2.10
 
